@@ -21,6 +21,7 @@ import datasets
 from omegaconf import OmegaConf
 from pathlib import Path
 
+from retreever import config
 from retreever.models.retreever import ReTreever
 from retreever.models.mrl import MRL
 from retreever.training.trainer import get_trainer
@@ -210,7 +211,6 @@ def train(cfg: OmegaConf):
             encoder_type=cfg.model.encoder_type,
             freeze_encoder=cfg.model.freeze_encoder,
             tree_type=cfg.model.tree_type,
-            cache_dir=None,  # Use HF defaults
             dual_model=cfg.model.dual_model,
             tree_depth=cfg.model.tree_depth,
             tree_split_fn=cfg.model.tree_split_fn,
@@ -231,7 +231,6 @@ def train(cfg: OmegaConf):
             loss=loss,
             encoder_type=cfg.model.encoder_type,
             freeze_encoder=cfg.model.freeze_encoder,
-            cache_dir=None,
             dual_model=cfg.model.dual_model,
             tree_split_fn=cfg.model.tree_split_fn,
             encoder_token_level=cfg.model.encoder_token_level,

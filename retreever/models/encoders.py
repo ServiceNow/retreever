@@ -6,6 +6,7 @@ audio (AST), and multimodal (FLAVA) encoders.
 import torch
 
 from abc import ABC, abstractmethod
+from retreever import config
 from transformers import (
     AutoModel,
     AutoTokenizer,
@@ -30,6 +31,7 @@ class BaseEncoder(ABC, torch.nn.Module):
         max_length: int = None,
         normalize: bool = False,
         tag: str = "ctx",
+        cache_dir: str = None,
     ):
         """Generic wrapper of encoders.
 
@@ -38,10 +40,12 @@ class BaseEncoder(ABC, torch.nn.Module):
             max_length: Maximal tokenizer's context length
             normalize: Whether returning normalized embeddings
             tag:  "question" for query encoder or "ctx" for context encoder
+            cache_dir: Where to cache HF files
         """
         super(BaseEncoder, self).__init__()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=max_length)
+        cache_dir = cache_dir or config.HF_CACHE_DIR
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=max_length, cache_dir=cache_dir)
         self.normalize = normalize
 
         if tag == "question":
@@ -115,8 +119,9 @@ class DistilBERTEncoder(BaseEncoder):
             cache_dir: Where to cache HF files
             token_level: Whether returning token embeddings or sentence embeddings
         """
-        super(DistilBERTEncoder, self).__init__(model_name, max_length, normalize, tag)
+        super(DistilBERTEncoder, self).__init__(model_name, max_length, normalize, tag, cache_dir)
 
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
         self.output_size = self.model.config.hidden_size
         self.token_level = token_level
@@ -164,8 +169,9 @@ class BGEEncoder(BaseEncoder):
             cache_dir: Where to cache HF files
             token_level: Whether returning token embeddings or sentence embeddings
         """
-        super(BGEEncoder, self).__init__(model_name, max_length, normalize, tag)
+        super(BGEEncoder, self).__init__(model_name, max_length, normalize, tag, cache_dir)
 
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
         self.output_size = self.model.config.hidden_size
         self.token_level = token_level
@@ -215,6 +221,7 @@ class DinoV2Encoder(BaseEncoder):
             token_level: Whether returning patch embeddings or CLS embeddings
         """
         torch.nn.Module.__init__(self)
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
         self.processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
@@ -315,6 +322,7 @@ class ResNetEncoder(BaseEncoder):
         if model_name not in model_dict:
             raise ValueError(f"Unsupported ResNet model: {model_name}. Choose from {list(model_dict.keys())}")
         
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         if cache_dir is not None:
             import os
             os.environ['TORCH_HOME'] = cache_dir
@@ -419,6 +427,7 @@ class CLIPEncoder(BaseEncoder):
             cache_dir: Where to cache HF files
             token_level: Whether returning patch embeddings or CLS embeddings
         """
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         torch.nn.Module.__init__(self)
         
         self.model = CLIPModel.from_pretrained(model_name, cache_dir=cache_dir)
@@ -558,6 +567,7 @@ class ASTEncoder(BaseAudioEncoder):
                 "AST requires transformers. Install with: pip install transformers"
             )
         
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         self.token_level = token_level
         self.model = ASTModel.from_pretrained(model_name, cache_dir=cache_dir)
         self.processor = ASTFeatureExtractor.from_pretrained(model_name, cache_dir=cache_dir)
@@ -624,6 +634,7 @@ class FlavaEncoder(BaseEncoder):
             cache_dir: Cache directory
             token_level: Return per-token/patch embeddings or pooled features (CLS token)
         """
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         torch.nn.Module.__init__(self)
         
         self.tag = tag

@@ -4,6 +4,7 @@ import torch
 from omegaconf import OmegaConf
 from typing import Callable, Optional
 
+from retreever import config
 from retreever.models.retreever import ReTreever
 
 
@@ -41,6 +42,7 @@ def load_from_ckpt(
         eval_level = 10
 
     # Instantiate model
+    cache_dir = cache_dir or config.HF_CACHE_DIR
     model = MRL(
         loss=None,
         encoder_type=cfg.model.encoder_type,

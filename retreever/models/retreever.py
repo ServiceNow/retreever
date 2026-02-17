@@ -3,6 +3,7 @@ import torch
 from omegaconf import OmegaConf
 from typing import Callable, Optional
 
+from retreever import config
 from retreever.models.encoders import get_encoders
 from retreever.models.trees import tree_dict
 from retreever.models.indexing_strategies import index_strategy_dict
@@ -83,6 +84,7 @@ def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwarg
         eval_depth = cfg.model.tree_depth
 
     # instantiate model
+    cache_dir = cache_dir or config.HF_CACHE_DIR
     model = ReTreever(
         loss=None,
         encoder_type=cfg.model.encoder_type,
@@ -385,6 +387,7 @@ class ReTreever(torch.nn.Module):
             raise ValueError(f"Token level encoding is not supported for {tree_split_fn} splits")
 
         # instantiate separate context encoder and tree
+        cache_dir = cache_dir or config.HF_CACHE_DIR
         self.query_encoder, self.context_encoder = get_encoders(
             self.encoder_type,
             cache_dir=cache_dir,
