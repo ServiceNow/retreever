@@ -1,4 +1,4 @@
-# ReTreever: Hierarchical Retrieval with Matryoshka Representations
+# ReTreever: Hierarchical Retrieval with Coarse-To-Fine Representations
 
 **ReTreever** is a flexible framework for training and evaluating hierarchical retrieval models with multi-resolution representations. It supports multiple modalities (text, images, audio) and various training strategies including product propagation, Matryoshka Representation Learning (MRL), and encoder fine-tuning with adapters.
 
