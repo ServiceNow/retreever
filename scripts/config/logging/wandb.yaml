@@ -1,0 +1,11 @@
+# Weights & Biases logging configuration
+
+# W&B settings
+wandb_project: "retreever"
+wandb_run: "exp_${dataset}_${model_type}"
+
+# Logging frequency
+log_every: 1000  # Log every N steps
+
+# Evaluation settings
+factor_val_irrelevant_ctxs: 10  # Factor for number of distractor contexts during evaluation

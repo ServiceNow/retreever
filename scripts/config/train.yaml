@@ -1,0 +1,17 @@
+defaults:
+  - model: retreever
+  - train: retreever
+  - logging: wandb
+
+# Dataset configuration  
+dataset: "nq"  # Options: nq, hotpotqa, repliqa, topiocqa, imagenet1k, voxceleb2, coco, flickr30k
+data_dir: "/path/to/data"  # Update with actual data path
+
+# Model type
+model_type: "retreever"  # Options: retreever, mrl
+
+# Experiment settings
+debug: false
+seed: 42
+ckpt: null  # Path to checkpoint to resume from
+savedir: "checkpoints/${dataset}/${model_type}"

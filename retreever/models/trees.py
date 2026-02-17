@@ -6,7 +6,7 @@ import torch
 
 from typing import Tuple
 
-from split_functions import split_dict
+from retreever.models.split_functions import split_dict
 from retreever.utils.algo import BinarySearchTree
 
 
@@ -252,7 +252,7 @@ class NoTree(torch.nn.Module):
 
         Args:
             input_size (Tuple[int]): size of inputs to route, e.g., (embedding_dim,) or (num_tokens, embedding_dim). Inputs will be flattened.
-            split_fn (str): type of split function. Supported options are provided in dssk.models.split_functions.split_dict
+            split_fn (str): type of split function. Supported options are provided in retreever.models.split_functions.split_dict
         """
         super(NoTree, self).__init__()
 
@@ -317,7 +317,7 @@ class NoPropagationTree(Tree):
         Args:
             input_size (Tuple[int]): size of inputs to route, e.g., (embedding_dim,) or (num_tokens, embedding_dim). Inputs will be flattened.
             depth (int): depth of the tree
-            split_fn (str): type of split function. Supported options are provided in dssk.models.split_functions.split_dict
+            split_fn (str): type of split function. Supported options are provided in retreever.models.split_functions.split_dict
         """
         self.bounding_fn = "sigmoid"
 

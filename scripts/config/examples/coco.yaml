@@ -1,0 +1,20 @@
+# COCO text-image retrieval configuration
+defaults:
+  - model: retreever
+  - train: retreever
+  - logging: wandb
+  - _self_
+
+dataset: "coco"
+data_dir: "/path/to/coco"
+model_type: "retreever"
+
+# Override encoder for text-image
+model:
+  encoder_type: "flava"
+  encoder_dim: 768
+  tree_depth: 10
+  loss_type: "contrastive"
+  dual_model: true  # Separate text and image encoders
+
+savedir: "checkpoints/coco"

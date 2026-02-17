@@ -3,11 +3,9 @@ import torch
 from omegaconf import OmegaConf
 from typing import Callable, Optional
 
-from dssk.models.encoders.encoders import get_encoders, merge_lora_weights
-from dssk.models.retrieval.trees import tree_dict
-from dssk.utils.toolkit_paths import PATH_HF_CACHE_RW
-
-from dssk.models.retrieval.indexing_strategies import index_strategy_dict
+from retreever.models.encoders import get_encoders
+from retreever.models.trees import tree_dict
+from retreever.models.indexing_strategies import index_strategy_dict
 import torch.nn.functional as F
 
 
@@ -15,63 +13,13 @@ def freeze_module(module):
     for param in module.parameters():
         param.requires_grad = False
 
-
-def auto_detect_lora_target_modules(model):
-    """Auto-detect attention layer names for LoRA targeting.
-    
-    Returns only query and value projections (standard LoRA practice).
-    
-    Args:
-        model: The model to inspect
-        
-    Returns:
-        list: Target module names (query and value only)
-    """
-    # Get all module names from the model
-    module_names = set()
-    for name, _ in model.named_modules():
-        leaf_name = name.split('.')[-1]
-        module_names.add(leaf_name)
-    
-    # Standard LoRA patterns: Query + Value only
-    qv_patterns = [
-        ('query', 'value'),          # BERT/RoBERTa/BGE
-        ('q_proj', 'v_proj'),        # LLaMA/Mistral/CLIP
-        ('q', 'v'),                  # T5
-        ('q_lin', 'v_lin'),          # DistilBERT
-    ]
-    
-    # Try each pattern and return the first match
-    for pattern in qv_patterns:
-        if all(name in module_names for name in pattern):
-            return list(pattern)
-    
-    # Fallback: find q and v attention layers
-    fallback_targets = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            leaf_name = name.split('.')[-1]
-            # Only include query and value variants
-            if any(qv in leaf_name.lower() for qv in ['query', 'value', 'q_lin', 'v_lin', 'q_proj', 'v_proj']):
-                if leaf_name not in fallback_targets:
-                    fallback_targets.append(leaf_name)
-    
-    if fallback_targets:
-        print(f"Warning: Using fallback LoRA targets: {fallback_targets}")
-        return fallback_targets
-    
-    raise ValueError(
-        f"Could not auto-detect LoRA target modules. Found modules: {sorted(module_names)}\n"
-        "Please manually specify lora_target_modules=['module_name1', 'module_name2']"
-    )
-
-def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = PATH_HF_CACHE_RW, **kwargs):
+def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwargs):
     """Loads a Retreever model given a checkpoint and a configuration.
 
     Args:
         ckpt_path (str): path to .bin checkpoint
         cfg_path (str): path to .yaml configuration file
-        cache_dir (str, optional): path to cache directory. Defaults to PATH_HF_CACHE_RW.
+        cache_dir (str, optional): path to cache directory. Defaults to None (uses HuggingFace default cache).
         **kwargs: Additional keyword arguments.
             - force_topk_strategy (bool): If provided and True, this is used to overwrite the model's
             existing evaluation strategy with the `topk_strategy` provided here (or 'greedy' as default)
@@ -381,7 +329,7 @@ class ReTreever(torch.nn.Module):
         cache_dir: str = None,
         dual_model: bool = False,
         freeze_encoder: bool = True,
-        encoder_finetune_strategy: str = "none",  # ADD: "none", "last_layer", "lora", "linear", "mlp", "adapter", "bitfit", "layernorm"
+        encoder_finetune_strategy: str = "none",  # Options: "none", "last_layer", "linear", "mlp", "adapter", "bitfit", "layernorm"
         emb_size: int = None,
         eval_strategy: str = "greedy",
         train_full_tree_rep: bool = False,
@@ -426,10 +374,6 @@ class ReTreever(torch.nn.Module):
         # Adapter/finetuning hyperparameters
         adapter_bottleneck_dim = module_params.pop("adapter_bottleneck_dim", 64)
         mlp_dropout = module_params.pop("mlp_dropout", 0.1)
-        lora_r = module_params.pop("lora_r", 8)
-        lora_alpha = module_params.pop("lora_alpha", 16)
-        lora_dropout = module_params.pop("lora_dropout", 0.1)
-        lora_target_modules = module_params.pop("lora_target_modules", None)
 
         # get encoder parameters
         self.token_level_enc = module_params.pop("encoder_token_level", False)
@@ -452,11 +396,6 @@ class ReTreever(torch.nn.Module):
         # lockin flags
         self.lock_in_query_encoder = module_params.pop("lock_in_query_encoder", False)
         self.lock_in_context_encoder = module_params.pop("lock_in_context_encoder", False)
-        
-        finetuned_encoder_path = module_params.pop("finetuned_encoder_path", None)
-        if finetuned_encoder_path is not None:
-            self.query_encoder, self.context_encoder = merge_lora_weights(finetuned_encoder_path, self.query_encoder, self.context_encoder)
-            print("Loaded finetuned encoders")
 
         if emb_size is None:
             emb_size = self.context_encoder.output_size
@@ -534,7 +473,7 @@ class ReTreever(torch.nn.Module):
                 # No finetuning strategy specified - raise error
                 raise ValueError(
                     "freeze_encoder=False but no encoder_finetune_strategy specified. "
-                    "Choose from: 'last_layer', 'lora', 'linear', 'mlp', 'adapter', 'bitfit', 'layernorm'"
+                    "Choose from: 'last_layer', 'linear', 'mlp', 'adapter', 'bitfit', 'layernorm'"
                 )
             
             elif encoder_finetune_strategy == "last_layer":
@@ -576,73 +515,6 @@ class ReTreever(torch.nn.Module):
                             f"Could not find transformer layers in {encoder.__class__.__name__}. "
                             f"Model structure: {type(encoder.model)}"
                         )
-                                
-            elif encoder_finetune_strategy == "lora":
-                try:
-                    from peft import LoraConfig, get_peft_model
-                except ImportError:
-                    raise ImportError("Please install peft: pip install peft")
-                
-                # Freeze encoders
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                # Auto-detect target modules if not specified
-                if lora_target_modules is None:
-                    # Auto-detect from context encoder (query encoder should have same structure)
-                    detected_targets = auto_detect_lora_target_modules(self.context_encoder.model)
-                    print(f"Auto-detected LoRA target modules: {detected_targets}")
-                    lora_target_modules = detected_targets
-                
-                # Apply LoRA
-                lora_config = LoraConfig(
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    target_modules=lora_target_modules,
-                    lora_dropout=lora_dropout,
-                    bias="none",
-                    # task_type="FEATURE_EXTRACTION"
-                )
-                
-                if self.context_encoder in encoders_to_finetune:
-                    self.context_encoder.model = get_peft_model(self.context_encoder.model, lora_config)
-                if self.query_encoder in encoders_to_finetune:
-                    self.query_encoder.model = get_peft_model(self.query_encoder.model, lora_config)
-                    
-            elif encoder_finetune_strategy == "lora_common":
-                try:
-                    from peft import LoraConfig, get_peft_model
-                except ImportError:
-                    raise ImportError("Please install peft: pip install peft")
-                
-                # Freeze encoders
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                # Auto-detect target modules if not specified
-                if lora_target_modules is None:
-                    detected_targets = auto_detect_lora_target_modules(self.context_encoder.model)
-                    print(f"Auto-detected LoRA target modules: {detected_targets}")
-                    lora_target_modules = detected_targets
-                
-                # Apply LoRA configuration
-                lora_config = LoraConfig(
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    target_modules=lora_target_modules,
-                    lora_dropout=lora_dropout,
-                    bias="none",
-                )
-                
-                # Apply LoRA to context encoder first
-                if self.context_encoder in encoders_to_finetune:
-                    self.context_encoder.model = get_peft_model(self.context_encoder.model, lora_config)
-                
-                # Share the same LoRA-adapted model with query encoder
-                if self.query_encoder in encoders_to_finetune:
-                    self.query_encoder.model = self.context_encoder.model
-                
-                print("Applied shared LoRA weights between query and context encoders")
                     
             elif encoder_finetune_strategy == "linear":
                 # Freeze encoders, add linear adapter on top

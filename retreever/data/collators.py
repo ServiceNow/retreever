@@ -389,40 +389,4 @@ class TextImageSupervisedCollator:
 
         return batch
 
-class ClusteringCollator(DefaultDataCollator):
-    def __init__(
-        self,
-    ) -> None:
-        """Creates instance of collator for clustering toy settings."""
 
-        super(ClusteringCollator, self).__init__(
-            return_tensors="pt",
-        )
-
-        self.output_keys = [
-            "question_ids",
-            "context_ids",
-            "question_attn_mask",
-            "context_attn_mask",
-            "context_uid",
-        ]
-
-    def __call__(self, batch_list: List[Dict]) -> Dict[str, torch.Tensor]:
-        """Maps list of dicts that must contain 'context', 'centroid' and 'centroid_id' keys.
-
-        Args:
-            batch_list (List[Dict]): List of examples.
-
-        Returns:
-            Dict[str, torch.Tensor]: Batches of tensors for 'question_ids', 'context_ids', 'question_attn_mask', 'context_attn_mask', "context_uid".
-        """
-
-        batch = {
-            "question_ids": torch.stack([example["centroid"] for example in batch_list]),
-            "question_attn_mask": None,
-            "context_ids": torch.stack([example["context"] for example in batch_list]),
-            "context_attn_mask": None,
-            "sample_idx": torch.tensor([example["centroid_id"] for example in batch_list]),
-        }
-
-        return batch

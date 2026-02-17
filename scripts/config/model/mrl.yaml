@@ -1,0 +1,24 @@
+# MRL (Matryoshka Representation Learning) model configuration
+
+# Encoder settings
+encoder_type: "distilbert"
+encoder_context_length: 512
+encoder_token_level: true
+encoder_normalize: false
+encoder_dim: 768
+
+# MRL uses flattened tree
+tree_split_fn: "linear"
+dual_model: false
+freeze_encoder: true
+
+# Split function parameters
+split_fn_embedding_dim: 768
+num_embeddings_per_node: 1
+cross_attn_scoring_fn_name: "linear_then_mean"
+split_fn_d_k: 768
+split_fn_n_heads: 12
+
+# Loss
+loss_type: "mrl"
+sim_measure: "cos_sim"

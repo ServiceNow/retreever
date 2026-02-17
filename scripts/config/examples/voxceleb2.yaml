@@ -1,0 +1,19 @@
+# VoxCeleb2 audio retrieval configuration
+defaults:
+  - model: retreever
+  - train: retreever
+  - logging: wandb
+  - _self_
+
+dataset: "voxceleb2"
+data_dir: "/path/to/voxceleb2"
+model_type: "retreever"
+
+# Override encoder for audio
+model:
+  encoder_type: "ast"
+  encoder_dim: 768
+  tree_depth: 10
+  loss_type: "multi_label_contrastive"
+
+savedir: "checkpoints/voxceleb2"

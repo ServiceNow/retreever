@@ -1,0 +1,37 @@
+# ReTreever model configuration
+
+# Encoder settings
+encoder_type: "distilbert"  # Options: distilbert, bge, dinov2-large, resnet50, clip-vit-large-patch14, ast, flava
+encoder_context_length: 512
+encoder_token_level: true
+encoder_normalize: false
+encoder_dim: 768
+
+# Tree settings
+tree_type: "no_propagation_tree"  # Options: no_propagation_tree, probabilistic_tree, no_tree
+tree_depth: 10
+tree_split_fn: "cross_attn"  # Options: cross_attn, mlp, linear
+
+# Dual model (separate query/context encoders)
+dual_model: false
+
+# Training settings
+freeze_encoder: true
+train_full_tree_rep: false
+
+# Split function parameters
+split_fn_embedding_dim: 768
+num_embeddings_per_node: 1
+cross_attn_scoring_fn_name: "propagate_single_mlp"
+split_fn_d_k: 512
+split_fn_n_heads: 8
+
+# Evaluation
+eval_strategy: "faiss_tree_rep"
+
+# Loss
+loss_type: "contrastive"  # Options: contrastive, multi_label_contrastive, mrl
+sim_measure: "cos_sim"  # Options: cos_sim, tvd
+
+# Advanced settings (usually not changed)
+node_embedding_strategy: "independent"

@@ -1,0 +1,32 @@
+# Training hyperparameters
+
+# Batch sizes
+train_batch_size: 64
+test_batch_size: 64
+
+# Optimization
+learning_rate: 0.0004
+lr_scheduler_type: "linear"
+warmup_ratio: 0.05
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_epsilon: 1e-6
+weight_decay: 0.05
+max_grad_norm: 1.0
+
+# Mixed precision
+fp16: true
+bf16: false
+
+# Training duration
+steps: 200000
+skip_steps: 1  # Gradient accumulation steps
+
+# Loss/temperature settings
+freeze_tmp: false
+tmp_scale: 64  # Initial temperature scale
+
+# Hierarchical training (depth curriculum)
+hierarchical: true
+depth_warmup_ratio: 0.1
+depth_scheduler_type: "random"  # Options: linear, exponential, random

@@ -1,14 +1,57 @@
+Metadata-Version: 2.4
+Name: retreever
+Version: 0.1.0
+Summary: Hierarchical Retrieval with Matryoshka Representations
+Home-page: https://github.com/yourusername/retreever
+Author: ReTreever Team
+License: MIT
+Project-URL: Homepage, https://github.com/yourusername/retreever
+Project-URL: Documentation, https://github.com/yourusername/retreever#readme
+Project-URL: Repository, https://github.com/yourusername/retreever
+Keywords: retrieval,hierarchical,matryoshka,representation-learning,neural-search
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.0.0
+Requires-Dist: transformers>=4.30.0
+Requires-Dist: datasets>=2.10.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: scikit-learn>=1.0.0
+Requires-Dist: faiss-cpu>=1.7.3
+Requires-Dist: omegaconf>=2.3.0
+Requires-Dist: hydra-core>=1.3.0
+Requires-Dist: wandb>=0.15.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: einops>=0.6.0
+Requires-Dist: timm>=0.9.0
+Provides-Extra: gpu
+Requires-Dist: faiss-gpu>=1.7.3; extra == "gpu"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=3.0.0; extra == "dev"
+Requires-Dist: black>=22.0.0; extra == "dev"
+Requires-Dist: isort>=5.10.0; extra == "dev"
+Requires-Dist: flake8>=4.0.0; extra == "dev"
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-python
+
 # ReTreever: Hierarchical Retrieval with Matryoshka Representations
 
 **ReTreever** is a flexible framework for training and evaluating hierarchical retrieval models with multi-resolution representations. It supports multiple modalities (text, images, audio) and various training strategies including product propagation, Matryoshka Representation Learning (MRL), and encoder fine-tuning with adapters.
 
 ## Features
 
-- 🌳 **Hierarchical Retrieval**: Tree-based retrieval with stochastic/constant depth sampling strategies
-- 🎓 **Depth Curriculum Learning**: 5 schedulers (random heavy-tailed, random linear, random uniform, linear warmup, exponential warmup)
+- 🌳 **Hierarchical Retrieval**: Tree-based retrieval with stochastic/constant sampling strategies
 - 🎯 **Multi-Resolution Learning**: Matryoshka Representation Learning for efficient embedding compression
-- 🔧 **Flexible Fine-tuning**: Support for MLP/Linear adapters with zero-init normalization
-- 🖼️ **Multi-Modal**: Text (DistilBERT, BGE), Images (DinoV2, ResNet, CLIP), Audio (AST), Text-Image (FLAVA)
+- 🔧 **Flexible Fine-tuning**: Support for MLP/Linear adapters, LoRA, and full fine-tuning
+- 🖼️ **Multi-Modal**: Text (DistilBERT), Images (DinoV2, ResNet50, CLIP), Audio (AST), and Text-Image (FLAVA)
 - ⚡ **Efficient Training**: DeepSpeed integration, mixed precision, and distributed training
 - 📊 **Comprehensive Evaluation**: NDCG@k, Recall@k, MRR metrics with FAISS-based indexing
 
@@ -52,83 +95,6 @@ model = ReTreever(
 # Train
 trainer = Trainer(model=model, config=config)
 trainer.train()
-```
-
-## Hierarchical Training with Depth Scheduling
-
-ReTreever supports **hierarchical training**, where the model is trained to make predictions at different tree depths. This is crucial for learning multi-resolution representations.
-
-### Training Strategies
-
-**Constant Depth Training** (`hierarchical: false`)
-- Trains at full tree depth throughout training
-- Simpler but less flexible
-- Used in: `prod_prop_revisited_constant_*` models
-
-**Stochastic Depth Training** (`hierarchical: true`)
-- Randomly samples depth at each training step
-- Better multi-resolution representations
-- Used in: `prod_prop_revisited_stochastic_*` models
-
-### Depth Schedulers
-
-Configure via `depth_scheduler_type` in config:
-
-```yaml
-train:
-  hierarchical: true  # Enable depth scheduling
-  depth_scheduler_type: "random"  # Scheduler type
-  depth_warmup_ratio: 0.1  # For non-random schedulers
-```
-
-**Available schedulers:**
-
-1. **`random`** (default for stochastic) - RandomHeavyTailedDepthScheduler
-   - Samples with quadratic weights: P(depth=d) ∝ d²
-   - Strongly biases towards deeper levels
-   - Best for final model performance
-
-2. **`random_linear`** - RandomDepthScheduler
-   - Samples with linear weights: P(depth=d) ∝ d
-   - Moderate bias towards deeper levels
-
-3. **`random_uniform`** - RandomUniformDepthScheduler
-   - Uniform sampling across all depths
-   - Equal probability for each depth
-
-4. **`linear`** - LinearDepthScheduler
-   - Gradually increases depth during warmup
-   - Starts at shallow, ends at full depth
-   - Good for curriculum learning
-
-5. **`exponential`** - ExponentialDepthScheduler
-   - Exponentially increases time spent at each depth
-   - Spends more time at deeper levels
-
-### Example Configurations
-
-**Stochastic with heavy-tailed sampling (typical):**
-```yaml
-train:
-  hierarchical: true
-  depth_scheduler_type: "random"
-  steps: 200000
-```
-
-**Constant depth (no scheduling):**
-```yaml
-train:
-  hierarchical: false
-  steps: 200000
-```
-
-**Linear warmup over first 10% of training:**
-```yaml
-train:
-  hierarchical: true
-  depth_scheduler_type: "linear"
-  depth_warmup_ratio: 0.1
-  steps: 200000
 ```
 
 ### Using Command Line

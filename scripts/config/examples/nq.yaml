@@ -1,0 +1,19 @@
+# Natural Questions (NQ) text retrieval configuration
+defaults:
+  - model: retreever
+  - train: retreever
+  - logging: wandb
+  - _self_
+
+dataset: "nq"
+data_dir: "/path/to/nq"
+model_type: "retreever"
+
+# Text encoder settings
+model:
+  encoder_type: "distilbert"  # Or bge
+  encoder_dim: 768
+  tree_depth: 10
+  loss_type: "contrastive"
+
+savedir: "checkpoints/nq"
