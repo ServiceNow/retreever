@@ -7,6 +7,7 @@ from retreever import config
 from retreever.models.encoders import get_encoders
 from retreever.models.trees import tree_dict
 from retreever.models.indexing_strategies import index_strategy_dict
+from retreever.models.adapters import get_adapter
 import torch.nn.functional as F
 
 
@@ -127,199 +128,12 @@ def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwarg
 
     return model, cfg
 
-class LinearAdapter(torch.nn.Module):
-    """Linear projection with residual connection."""
-    def __init__(self, input_dim: int, output_dim: int):
-        super().__init__()
-        self.projection = torch.nn.Linear(input_dim, output_dim)
-        
-    def forward(self, x):
-        return x + self.projection(x)  # Residual connection
-    
-class LinearAdapterZeroInit(torch.nn.Module):
-    """Linear projection with residual connection."""
-    def __init__(self, input_dim: int, output_dim: int):
-        super().__init__()
-        self.projection = torch.nn.Linear(input_dim, output_dim)
-        
-        # --- FIX: Zero Initialization ---
-        # This ensures the adapter starts as an identity function (output = x + 0)
-        torch.nn.init.zeros_(self.projection.weight)
-        torch.nn.init.zeros_(self.projection.bias)
-        
-    def forward(self, x):
-        return x + self.projection(x)
 
-
-class MLPAdapter(torch.nn.Module):
-    """MLP adapter with 4x expansion and residual connection."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = input_dim * 4
-        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.ReLU()
-        self.dropout = torch.nn.Dropout(dropout)
-        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, x):
-        residual = x
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return residual + x  # Residual connection
-    
-class MLPAdapterWithZeroInit(torch.nn.Module):
-    """MLP adapter with 4x expansion and residual connection."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = input_dim * 4
-        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.ReLU()
-        self.dropout = torch.nn.Dropout(dropout)
-        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
-
-        # --- FIX: Zero Initialization for the LAST layer only ---
-        torch.nn.init.zeros_(self.fc2.weight)
-        torch.nn.init.zeros_(self.fc2.bias)
-        
-    def forward(self, x):
-        residual = x
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return residual + x
-    
-class MLPAdapterWithZeroInitNorm(torch.nn.Module):
-    """MLP adapter with 4x expansion and residual connection."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = input_dim * 4
-        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.ReLU()
-        self.dropout = torch.nn.Dropout(dropout)
-        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
-
-        # --- FIX: Zero Initialization for the LAST layer only ---
-        torch.nn.init.zeros_(self.fc2.weight)
-        torch.nn.init.zeros_(self.fc2.bias)
-        
-    def forward(self, x):
-        residual = x
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return F.normalize(residual + x, p=2, dim=-1)
-    
-class LinearAdapterWithZeroInitNorm(torch.nn.Module):
-    """MLP adapter with 4x expansion and residual connection."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.projection = torch.nn.Linear(input_dim, output_dim)
-        
-        # This ensures the adapter starts as an identity function (output = x + 0)
-        torch.nn.init.zeros_(self.projection.weight)
-        torch.nn.init.zeros_(self.projection.bias)
-        
-    def forward(self, x):
-        return F.normalize(x + self.projection(x), p=2, dim=-1)
-    
-
-class MRLAdapter(torch.nn.Module):
-    """Adapter for MRL learning"""
-    def __init__(self, input_dim: int, output_dim: int):
-        super().__init__()
-        self.projection = torch.nn.Linear(input_dim, output_dim)
-        
-    def forward(self, x):
-        return self.projection(x)
-    
-    
-class MLPAdapterWithoutResidual(torch.nn.Module):
-    """MLP adapter with 4x expansion and residual connection."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = input_dim * 4
-        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.ReLU()
-        self.dropout = torch.nn.Dropout(dropout)
-        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return  x  # Residual connection
-
-
-class BottleneckAdapter(torch.nn.Module):
-    """Houlsby-style bottleneck adapter with residual."""
-    def __init__(self, input_dim: int, bottleneck_dim: int = 64):
-        super().__init__()
-        self.down_project = torch.nn.Linear(input_dim, bottleneck_dim)
-        self.activation = torch.nn.ReLU()
-        self.up_project = torch.nn.Linear(bottleneck_dim, input_dim)
-        
-    def forward(self, x):
-        residual = x
-        x = self.down_project(x)
-        x = self.activation(x)
-        x = self.up_project(x)
-        return residual + x  # Residual connection (Houlsby-style)
-    
-class OptimizedBottleneckAdapter(torch.nn.Module):
-    """Low-rank bottleneck with zero init."""
-    def __init__(self, input_dim: int, reduction_factor: int = 8):
-        super().__init__()
-        bottleneck_dim = input_dim // reduction_factor
-        
-        self.down_project = torch.nn.Linear(input_dim, bottleneck_dim)
-        self.activation = torch.nn.GELU()
-        self.up_project = torch.nn.Linear(bottleneck_dim, input_dim)
-        
-        # Init Strategy:
-        # 1. Kaiming/Xavier for the down projection (to preserve variance)
-        torch.nn.init.kaiming_normal_(self.down_project.weight)
-        
-        # 2. ZERO init for the up projection (to start as identity)
-        torch.nn.init.zeros_(self.up_project.weight)
-        torch.nn.init.zeros_(self.up_project.bias)
-        
-    def forward(self, x):
-        residual = x
-        x = self.down_project(x)
-        x = self.activation(x)
-        x = self.up_project(x)
-        return residual + x
-
-class PreNormAdapter(torch.nn.Module):
-    """Applies LayerNorm before the adapter, keeping residual clean."""
-    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.norm = torch.nn.LayerNorm(input_dim)
-        
-        hidden_dim = input_dim * 4
-        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
-        self.activation = torch.nn.GELU()
-        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
-        
-        # Zero Init the last layer
-        torch.nn.init.zeros_(self.fc2.weight)
-        torch.nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, x):
-        residual = x
-        
-        # Norm only affects the adapter branch
-        out = self.norm(x)
-        out = self.fc1(out)
-        out = self.activation(out)
-        out = self.fc2(out)
-        
-        return residual + out
+# Note: Adapter classes have been moved to retreever/models/adapters.py
+# Only 3 finetune strategies are now supported:
+# - shared_mlp_zero_init_norm
+# - shared_linear_zero_init_norm  
+# - mrl
 
 class ReTreever(torch.nn.Module):
     def __init__(
@@ -331,7 +145,7 @@ class ReTreever(torch.nn.Module):
         cache_dir: str = None,
         dual_model: bool = False,
         freeze_encoder: bool = True,
-        encoder_finetune_strategy: str = "none",  # Options: "none", "last_layer", "linear", "mlp", "adapter", "bitfit", "layernorm"
+        encoder_finetune_strategy: str = "none",  # Options: "shared_mlp_zero_init_norm", "shared_linear_zero_init_norm", "mrl"
         emb_size: int = None,
         eval_strategy: str = "greedy",
         train_full_tree_rep: bool = False,
@@ -476,172 +290,31 @@ class ReTreever(torch.nn.Module):
                 # No finetuning strategy specified - raise error
                 raise ValueError(
                     "freeze_encoder=False but no encoder_finetune_strategy specified. "
-                    "Choose from: 'last_layer', 'linear', 'mlp', 'adapter', 'bitfit', 'layernorm'"
+                    "Choose from: 'shared_mlp_zero_init_norm', 'shared_linear_zero_init_norm', 'mrl'"
                 )
             
-            elif encoder_finetune_strategy == "last_layer":
-                # Freeze entire encoder first
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                    
-                for encoder in encoders_to_finetune:
-                    # Check if this is ResNet
-                    if hasattr(encoder, '__class__') and 'ResNet' in encoder.__class__.__name__:
-                        # For ResNet: unfreeze the last sequential block
-                        # ResNet is wrapped as nn.Sequential, so access the last child
-                        last_layer = list(encoder.model.children())[-1]
-                        for param in last_layer.parameters():
-                            param.requires_grad = True
-                        print(f"Unfroze last layer for ResNet encoder")
-                        continue
-                    
-                    # Try common transformer layer paths
-                    layers = None
-                    
-                    # BERT/RoBERTa/BGE/Contriever/SimCSE: model.encoder.layer
-                    if hasattr(encoder.model, 'encoder') and hasattr(encoder.model.encoder, 'layer'):
-                        layers = encoder.model.encoder.layer
-                    # DistilBERT: model.transformer.layer
-                    elif hasattr(encoder.model, 'transformer') and hasattr(encoder.model.transformer, 'layer'):
-                        layers = encoder.model.transformer.layer
-                    # Direct access: model.layer (some custom wrappers)
-                    elif hasattr(encoder.model, 'layer'):
-                        layers = encoder.model.layer
-                    
-                    if layers is not None:
-                        # Unfreeze last layer
-                        for param in layers[-1].parameters():
-                            param.requires_grad = True
-                        print(f"Unfroze last layer for {encoder.__class__.__name__}")
-                    else:
-                        raise ValueError(
-                            f"Could not find transformer layers in {encoder.__class__.__name__}. "
-                            f"Model structure: {type(encoder.model)}"
-                        )
-                    
-            elif encoder_finetune_strategy == "linear":
-                # Freeze encoders, add linear adapter on top
+            elif encoder_finetune_strategy in ["shared_mlp_zero_init_norm", "shared_linear_zero_init_norm", "mrl"]:
+                # Freeze encoders and add shared adapter using get_adapter factory
                 freeze_module(self.query_encoder)
                 freeze_module(self.context_encoder)
                 
-                self.query_projection = LinearAdapter(emb_size, emb_size)
-                self.context_projection = LinearAdapter(emb_size, emb_size)
-
-            elif encoder_finetune_strategy == "linear_zero_init":
-                # Freeze encoders, add linear adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
+                # Use factory function from adapters.py
+                adapter = get_adapter(
+                    strategy=encoder_finetune_strategy,
+                    input_dim=emb_size,
+                    output_dim=emb_size,
+                    dropout=mlp_dropout
+                )
                 
-                self.query_projection = LinearAdapterZeroInit(emb_size, emb_size)
-                self.context_projection = LinearAdapterZeroInit(emb_size, emb_size)
-                
-            elif encoder_finetune_strategy == "mlp":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = MLPAdapter(emb_size, emb_size, dropout=mlp_dropout)
-                self.context_projection = MLPAdapter(emb_size, emb_size, dropout=mlp_dropout)
-                
-            elif encoder_finetune_strategy == "mlp_no_residual":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = MLPAdapterWithoutResidual(emb_size, emb_size, dropout=mlp_dropout)
-                self.context_projection = MLPAdapterWithoutResidual(emb_size, emb_size, dropout=mlp_dropout)
-                
-            elif encoder_finetune_strategy == "mlp_zero_init":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
-                self.context_projection = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
-                
-            elif encoder_finetune_strategy == "shared_mlp_zero_init":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                adapter = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
-                
-                self.query_projection = adapter
-                self.context_projection = adapter    
-                            
-            elif encoder_finetune_strategy == "shared_mlp_zero_init_norm":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                adapter = MLPAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
-                
+                # Share the adapter between query and context
                 self.query_projection = adapter
                 self.context_projection = adapter
-                
-            elif encoder_finetune_strategy == "shared_linear_zero_init_norm":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                adapter = LinearAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
-                
-                self.query_projection = adapter
-                self.context_projection = adapter
-                
-            elif encoder_finetune_strategy == "pre_norm_mlp":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = PreNormAdapter(emb_size, emb_size, dropout=mlp_dropout)
-                self.context_projection = PreNormAdapter(emb_size, emb_size, dropout=mlp_dropout)
-                
-            elif encoder_finetune_strategy == "mrl":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                adapter = MRLAdapter(emb_size, emb_size)
-                
-                self.query_projection = adapter
-                self.context_projection = adapter
-                
-            elif encoder_finetune_strategy == "bottleneck":
-                # Freeze encoders, add MLP adapter on top
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = OptimizedBottleneckAdapter(emb_size)
-                self.context_projection = OptimizedBottleneckAdapter(emb_size)
-                
-            elif encoder_finetune_strategy == "adapter":
-                # Freeze encoders, add Houlsby-style bottleneck adapter
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                self.query_projection = BottleneckAdapter(emb_size, bottleneck_dim=adapter_bottleneck_dim)
-                self.context_projection = BottleneckAdapter(emb_size, bottleneck_dim=adapter_bottleneck_dim)
-                
-            elif encoder_finetune_strategy == "bitfit":
-                # Freeze all except bias parameters
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                for encoder in encoders_to_finetune:
-                    for name, param in encoder.named_parameters():
-                        if 'bias' in name:
-                            param.requires_grad = True
-                            
-            elif encoder_finetune_strategy == "layernorm":
-                # Freeze all except LayerNorm parameters
-                freeze_module(self.query_encoder)
-                freeze_module(self.context_encoder)
-                
-                for encoder in encoders_to_finetune:
-                    for name, param in encoder.named_parameters():
-                        if 'LayerNorm' in name or 'layer_norm' in name:
-                            param.requires_grad = True
                             
             else:
-                raise ValueError(f"Unknown encoder_finetune_strategy: {encoder_finetune_strategy}")
+                raise ValueError(
+                    f"Unknown encoder_finetune_strategy: {encoder_finetune_strategy}. "
+                    f"Supported strategies: 'shared_mlp_zero_init_norm', 'shared_linear_zero_init_norm', 'mrl'"
+                )
             
         # Load from checkpoint if provided (must happen after LoRA is applied)
         if self._pending_checkpoint_load is not None:

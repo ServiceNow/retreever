@@ -1,16 +1,16 @@
 # ReTreever: Hierarchical Retrieval with Coarse-To-Fine Representations
 
-**ReTreever** is a flexible framework for training and evaluating hierarchical retrieval models with multi-resolution representations. It supports multiple modalities (text, images, audio) and various training strategies including product propagation, Matryoshka Representation Learning (MRL), and encoder fine-tuning with adapters.
+**ReTreever** is a framework for training and evaluating hierarchical retrieval models with multi-resolution representations. It supports multiple modalities (text, images, audio) and encoder fine-tuning strategies.
 
 ## Features
 
-- 🌳 **Hierarchical Retrieval**: Tree-based retrieval with stochastic/constant depth sampling strategies
-- 🎓 **Depth Curriculum Learning**: 5 schedulers (random heavy-tailed, random linear, random uniform, linear warmup, exponential warmup)
-- 🎯 **Multi-Resolution Learning**: Matryoshka Representation Learning for efficient embedding compression
-- 🔧 **Flexible Fine-tuning**: Support for MLP/Linear adapters with zero-init normalization
+- 🌳 **Hierarchical Retrieval**: Tree-based retrieval with stochastic or constant depth training
+- 🎓 **Depth Curriculum Learning**: Multiple schedulers (random heavy-tailed, random linear, random uniform, linear warmup, exponential warmup)
+- 🎯 **Multi-Resolution Learning**: Matryoshka Representation Learning (MRL) for efficient embedding compression
+- 🔧 **Encoder Fine-tuning**: Shared MLP/Linear adapters with zero-init normalization
 - 🖼️ **Multi-Modal**: Text (DistilBERT, BGE), Images (DinoV2, ResNet, CLIP), Audio (AST), Text-Image (FLAVA)
 - ⚡ **Efficient Training**: DeepSpeed integration, mixed precision, and distributed training
-- 📊 **Comprehensive Evaluation**: NDCG@k, Recall@k, MRR metrics with FAISS-based indexing
+- 📊 **Comprehensive Evaluation**: NDCG@k, Hit@k, MAP@k metrics with FAISS-based indexing
 
 ## Installation
 
@@ -39,14 +39,14 @@ from retreever.training import Trainer
 from retreever.utils import load_config
 
 # Load configuration
-config = load_config("configs/imagenet/prod_prop_stochastic_dinov2.yaml")
+cfg = load_config("configs/imagenet/retreever_stochastic_dinov2.yaml")
 
 # Create model
 model = ReTreever(
     encoder_type="dinov2-large",
     tree_type="no_propagation_tree",
     tree_depth=10,
-    **config.model
+    **cfg.model
 )
 
 # Train
@@ -63,12 +63,10 @@ ReTreever supports **hierarchical training**, where the model is trained to make
 **Constant Depth Training** (`hierarchical: false`)
 - Trains at full tree depth throughout training
 - Simpler but less flexible
-- Used in: `prod_prop_revisited_constant_*` models
 
 **Stochastic Depth Training** (`hierarchical: true`)
 - Randomly samples depth at each training step
 - Better multi-resolution representations
-- Used in: `prod_prop_revisited_stochastic_*` models
 
 ### Depth Schedulers
 
@@ -135,53 +133,91 @@ train:
 
 ```bash
 # Train ImageNet model with DinoV2
-python scripts/train.py --config configs/imagenet/prod_prop_stochastic_dinov2.yaml
+python scripts/train.py --config configs/imagenet/retreever_stochastic_dinov2.yaml
 
-# Evaluate a trained model
-python scripts/evaluate.py --checkpoint path/to/checkpoint.pt --dataset imagenet1k
+# Evaluate a trained model on image retrieval
+python scripts/evaluate_image.py --model_ckpt path/to/checkpoint.pt \
+                                   --model_cfg path/to/config.yaml \
+                                   --dataset imagenet \
+                                   --data_dir /path/to/imagenet1k
 
-# Train text retrieval on NQ dataset
-python scripts/train.py --config configs/text/nq_adapter_mlp_distilbert.yaml
+# Evaluate a trained model on text retrieval
+python scripts/evaluate_text.py --model_ckpt path/to/checkpoint.pt \
+                                  --model_cfg path/to/config.yaml \
+                                  --dataset nq \
+                                  --data_dir /path/to/nq
+
+# Evaluate a trained model on audio retrieval
+python scripts/evaluate_audio.py --model_ckpt path/to/checkpoint.pt \
+                                   --model_cfg path/to/config.yaml \
+                                   --dataset voxceleb2 \
+                                   --data_dir /path/to/voxceleb2
 ```
+
+## Supported Models
+
+### Encoder Fine-tuning Strategies
+
+Three strategies are supported:
+
+| Strategy | Description |
+|----------|-------------|
+| `shared_mlp_zero_init_norm` | Shared MLP adapter with zero-init and L2 normalization |
+| `shared_linear_zero_init_norm` | Shared linear adapter with zero-init and L2 normalization |
+| `mrl` | Matryoshka Representation Learning (projection layer) |
+
+All strategies share a single adapter between the query and context encoders.
+
+### Indexing Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `faiss_tree_rep` | FAISS-based tree representation indexing |
+| `tree_rep_multi_index_faiss` | FAISS with multi-index (one per tree depth) |
+
+### Split Functions
+
+| Function | Description |
+|----------|-------------|
+| `linear` | Linear projection split |
+| `mlp` | MLP projection split |
+| `cross_attn` | Cross-attention split (supports token-level encoding) |
 
 ## Model Zoo
 
-### Image Models (ImageNet1k)
+### Image Models (ImageNet-1K)
 
 | Model | Encoder | Strategy | Config | NDCG@10 |
 |-------|---------|----------|--------|---------|
-| **Product Propagation (Constant)** | DinoV2-Large | Tree-based | `imagenet/prod_prop_constant_dinov2.yaml` | TBD |
-| **Product Propagation (Stochastic)** | DinoV2-Large | Tree-based | `imagenet/prod_prop_stochastic_dinov2.yaml` | TBD |
+| **ReTreever (Constant)** | DinoV2-Large | Tree-based | `imagenet/retreever_constant_dinov2.yaml` | TBD |
+| **ReTreever (Stochastic)** | DinoV2-Large | Tree-based | `imagenet/retreever_stochastic_dinov2.yaml` | TBD |
 | **MRL** | DinoV2-Large | Multi-resolution | `imagenet/mrl_dinov2.yaml` | TBD |
-| **Adapter (MLP)** | DinoV2-Large | Fine-tuned | `imagenet/adapter_mlp_dinov2.yaml` | TBD |
-| **Adapter (Linear)** | DinoV2-Large | Fine-tuned | `imagenet/adapter_linear_dinov2.yaml` | TBD |
 
 ### Audio Models (VoxCeleb2)
 
 | Model | Encoder | Strategy | Config | NDCG@10 |
 |-------|---------|----------|--------|---------|
-| **Product Propagation (Stochastic)** | AST | Tree-based | `voxceleb/prod_prop_stochastic_ast.yaml` | TBD |
-| **Product Propagation (Constant)** | AST | Tree-based | `voxceleb/prod_prop_constant_ast.yaml` | TBD |
+| **ReTreever (Stochastic)** | AST | Tree-based | `voxceleb/retreever_stochastic_ast.yaml` | TBD |
+| **ReTreever (Constant)** | AST | Tree-based | `voxceleb/retreever_constant_ast.yaml` | TBD |
 | **MRL** | AST | Multi-resolution | `voxceleb/mrl_ast.yaml` | TBD |
-| **Adapter (MLP)** | AST | Fine-tuned | `voxceleb/adapter_mlp_ast.yaml` | TBD |
 
 ### Text Models (NQ, HotpotQA, RepliQA, TopiocQA)
 
 | Dataset | Model | Encoder | Config | NDCG@10 |
 |---------|-------|---------|--------|---------|
-| **NQ** | MLP Adapter | DistilBERT | `text/nq_adapter_mlp_distilbert.yaml` | TBD |
-| **NQ** | Linear Adapter | DistilBERT | `text/nq_adapter_linear_distilbert.yaml` | TBD |
+| **NQ** | ReTreever (MLP Adapter) | DistilBERT | `text/nq_retreever_mlp_distilbert.yaml` | TBD |
+| **NQ** | ReTreever (Linear Adapter) | DistilBERT | `text/nq_retreever_linear_distilbert.yaml` | TBD |
 | **NQ** | MRL | DistilBERT | `text/nq_mrl_distilbert.yaml` | TBD |
-| **HotpotQA** | MLP Adapter | DistilBERT | `text/hotpotqa_adapter_mlp_distilbert.yaml` | TBD |
-| **RepliQA** | MLP Adapter | DistilBERT | `text/repliqa_adapter_mlp_distilbert.yaml` | TBD |
-| **TopiocQA** | MLP Adapter | DistilBERT | `text/topiocqa_adapter_mlp_distilbert.yaml` | TBD |
+| **HotpotQA** | ReTreever (MLP Adapter) | DistilBERT | `text/hotpotqa_retreever_mlp_distilbert.yaml` | TBD |
+| **RepliQA** | ReTreever (MLP Adapter) | DistilBERT | `text/repliqa_retreever_mlp_distilbert.yaml` | TBD |
+| **TopiocQA** | ReTreever (MLP Adapter) | DistilBERT | `text/topiocqa_retreever_mlp_distilbert.yaml` | TBD |
 
 ### Multimodal Models (COCO, Flickr30k)
 
 | Dataset | Model | Encoder | Config | NDCG@10 |
 |---------|-------|---------|--------|---------|
-| **COCO** | FLAVA | FLAVA | `multimodal/coco_flava.yaml` | TBD |
-| **Flickr30k** | FLAVA | FLAVA | `multimodal/flickr_flava.yaml` | TBD |
+| **COCO** | ReTreever | FLAVA | `multimodal/coco_flava.yaml` | TBD |
+| **Flickr30k** | ReTreever | FLAVA | `multimodal/flickr_flava.yaml` | TBD |
 
 ## Directory Structure
 
@@ -194,23 +230,29 @@ retreever/
 │   └── multimodal/      # Multimodal configs
 ├── retreever/           # Main package
 │   ├── models/          # Model architectures
+│   │   ├── retreever.py # Main ReTreever model
+│   │   ├── mrl.py       # MRL model
+│   │   ├── adapters.py  # Adapter classes (3 strategies)
+│   │   ├── encoders.py  # Encoder implementations
+│   │   ├── split_functions.py  # Tree split functions
+│   │   └── indexing_strategies.py  # FAISS indexing
 │   ├── training/        # Training pipeline
 │   ├── data/            # Data loading
 │   ├── evaluation/      # Evaluation metrics
-│   ├── utils/           # Utilities
-│   └── hub/             # Pre-trained models
+│   └── utils/           # Utilities
 ├── scripts/             # Training/evaluation scripts
-├── tests/               # Unit & integration tests
-└── docs/                # Documentation
-
+│   ├── train.py         # Training script
+│   ├── evaluate.py      # General evaluation
+│   ├── evaluate_text.py # Text retrieval evaluation
+│   ├── evaluate_image.py # Image retrieval evaluation
+│   └── evaluate_audio.py # Audio retrieval evaluation
+└── tests/               # Unit & integration tests
 ```
 
 ## Documentation
 
 - [Training Guide](docs/training_guide.md) - Detailed training instructions
-- [Model Zoo](docs/model_zoo.md) - All supported models and their configurations
-- [API Reference](docs/api_reference.md) - Complete API documentation
-- [Configuration Guide](docs/configuration.md) - Understanding config files
+- [Configuration Guide](CONFIG_GUIDE.md) - Understanding config files and cache settings
 
 ## Citation
 

@@ -591,8 +591,8 @@ class CrossAttentionSplit(torch.nn.Module):
             nn.init.zeros_(layer.bias)
 
 
-
-split_dict = {  # supported split modulestorch.nn.init.zeros_(self.value_proj.bias)
+# Only 3 split functions are supported
+split_dict = {
     "linear": LinearSplit,
     "mlp": MLPSplit,
     "cross_attn": CrossAttentionSplit,
