@@ -18,10 +18,11 @@ HF_CACHE_DIR = None
 # the corresponding ReTreever loader expects.  Use ``scripts/data_prep/*.py``
 # to produce these directories from the original sources.
 DATA_PATHS = {
-    "nq": "/path/to/nq",
     "hotpotqa": "/path/to/hotpotqa",
-    "topiocqa_all_history": "/path/to/topiocqa_all_history",
-    "repliqa_0to3_4": "/path/to/repliqa_0to3_4",
+    "topiocqa": "/path/to/topiocqa",
+    "repliqa": "/path/to/repliqa",
     "imagenet1k": "/path/to/imagenet1k",
     "voxceleb2": "/path/to/voxceleb2",
+    # Add your own datasets here, e.g.:
+    # "my_dataset": "/path/to/my_dataset",
 }

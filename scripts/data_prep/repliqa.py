@@ -1,7 +1,7 @@
-"""Prepare ``repliqa_0to3_4`` for ReTreever training.
+"""Prepare ``repliqa`` for ReTreever training.
 
 Faithful port of the original notebook recipe used to produce the
-``repliqa_0to3_4`` dataset:
+``repliqa`` dataset:
 
 1. Load ``ServiceNow/repliqa`` from Hugging Face. The dataset is published as
    five non-overlapping splits ``repliqa_0`` ... ``repliqa_4``.
@@ -13,13 +13,13 @@ Faithful port of the original notebook recipe used to produce the
 5. Assign a single integer ``context_uid`` per distinct context string,
    globally across all three splits.
 
-Output ``DatasetDict`` splits: ``train``, ``val``, ``test``, ``cuid2text``.
+Output ``DatasetDict`` splits: ``train``, ``val``, ``test``.
 
 USAGE
 -----
 ::
 
-    python -m scripts.data_prep.repliqa_0to3_4 --out-dir /path/to/repliqa_0to3_4
+    python -m scripts.data_prep.repliqa --out-dir /path/to/repliqa
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 from datasets import Dataset, DatasetDict, load_dataset
 
-DATASET_NAME = "repliqa_0to3_4"
+DATASET_NAME = "repliqa"
 HF_REPO = "ServiceNow/repliqa"
 SEED = 42
 N_VAL_DOC_IDS = 400
@@ -128,17 +128,12 @@ def main():
     test_converted = _convert_examples(test_examples_raw, "test", context_to_uid)
 
     print(f"\nUnique contexts across all splits: {len(context_to_uid)}")
-    cuid2text = [
-        {"context_uid": uid, "context": text} for text, uid in context_to_uid.items()
-    ]
-    cuid2text.sort(key=lambda x: x["context_uid"])
 
     retreever_data = DatasetDict(
         {
             "train": Dataset.from_list(train_converted),
             "val": Dataset.from_list(val_converted),
             "test": Dataset.from_list(test_converted),
-            "cuid2text": Dataset.from_list(cuid2text),
         }
     )
 
@@ -149,7 +144,7 @@ def main():
     print("\nDone. Summary:")
     for name, ds in retreever_data.items():
         print(f"  {name}: {len(ds)} rows")
-    print(f"\nKNOWN_DATASETS['repliqa_0to3_4'] = {out_dir.resolve()}")
+    print(f"\nKNOWN_DATASETS['repliqa'] = {out_dir.resolve()}")
 
 
 if __name__ == "__main__":

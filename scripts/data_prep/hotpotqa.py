@@ -1,8 +1,8 @@
 """Prepare HotpotQA for ReTreever training.
 
 Downloads ``hotpot_qa`` (config ``distractor``) from Hugging Face and converts
-it to the same canonical ReTreever schema used by ``topiocqa_all_history`` and
-``repliqa_0to3_4``:
+it to the same canonical ReTreever schema used by ``topiocqa`` and
+``repliqa``:
 
   - ``context``         (str) -- concatenation of supporting paragraphs
                                   (kept around so the dataset also works with
@@ -18,11 +18,10 @@ it to the same canonical ReTreever schema used by ``topiocqa_all_history`` and
   - ``context_uid``     (int) -- unique per distinct gold-context concatenation;
                                   shared across train/val splits
 
-Output ``DatasetDict``: ``train``, ``val``, ``cuid2text``.
+Output ``DatasetDict``: ``train``, ``val``.
 
-Note: there is no original ``create_hotpotqa.py`` script in the research repo
-that we are mirroring. This recipe matches the schema observed in the canonical
-``hotpotqa`` snapshot used during training.
+This recipe writes the canonical schema documented in the README's
+``Bring your own dataset`` section.
 
 USAGE
 -----
@@ -113,16 +112,11 @@ def main():
     splits["val"] = _convert_examples(raw[val_key], "val", context_to_uid)
 
     print(f"\nUnique gold-context concatenations across all splits: {len(context_to_uid)}")
-    cuid2text = [
-        {"context_uid": uid, "context": text} for text, uid in context_to_uid.items()
-    ]
-    cuid2text.sort(key=lambda x: x["context_uid"])
 
     retreever_data = DatasetDict(
         {
             "train": Dataset.from_list(splits["train"]),
             "val": Dataset.from_list(splits["val"]),
-            "cuid2text": Dataset.from_list(cuid2text),
         }
     )
 

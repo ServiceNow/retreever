@@ -18,8 +18,6 @@ tmp_scale: 64
 hierarchical: True
 depth_warmup_ratio: 0.1
 depth_scheduler_type: "random"
-balance_hp: 0.
-sharpness_hp: 0.
 l1_lambda: 0.0
 entropy_lambda: 0.0
 max_prob_lambda: 0.0
@@ -40,5 +38,4 @@ max_tmp_cq: null
 use_depth_wise_temps: false
 hard_assignment_reg_lambda: 0.0
 optimize_whole_emb: false
-base_loss_type: "contrastive"
 path_consistency_skip_connection_lambda: 0.0

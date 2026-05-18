@@ -410,11 +410,11 @@ def train(cfg: OmegaConf):
             model.context_encoder.processor,
         )
     else:
-        # topiocqa_all_history packs the full conversation history into the
+        # topiocqa packs the full conversation history into the
         # question (most recent turn last), so we want to truncate from the
         # left to keep the most recent context.
         query_truncate_from_left = (
-            "topiocqa_all_history" in cfg.get("dataset", "")
+            "topiocqa" in cfg.get("dataset", "")
             or "+" in cfg.get("dataset", "")
         )
         collator = SupervisedCollator(

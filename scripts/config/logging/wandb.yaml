@@ -1,4 +1,4 @@
 log_every: 10000
-wandb_project: "retreeval"
+wandb_project: "retreever"
 wandb_run: null
 factor_val_irrelevant_ctxs: 5

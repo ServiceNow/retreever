@@ -1,7 +1,7 @@
-"""Prepare ``topiocqa_all_history`` for ReTreever training.
+"""Prepare ``topiocqa`` for ReTreever training.
 
 Faithful port of the original ``create_topiocqa_allhistory.py`` recipe used
-to produce the ``topiocqa_all_history`` dataset:
+to produce the ``topiocqa`` dataset:
 
 1. Download the raw TopiOCQA JSONL files directly from Hugging Face:
    ``McGill-NLP/TopiOCQA/data/topiocqa_{train,valid}.jsonl``.
@@ -14,15 +14,14 @@ to produce the ``topiocqa_all_history`` dataset:
 5. Assign a single integer ``context_uid`` per distinct context string,
    globally across all three splits.
 
-The resulting ``DatasetDict`` has splits: ``train``, ``val``, ``test``,
-``cuid2text``. ``cuid2text`` is the global uid -> text lookup (sorted by uid).
+The resulting ``DatasetDict`` has splits: ``train``, ``val``, ``test``.
 
 USAGE
 -----
 ::
 
-    python -m scripts.data_prep.topiocqa_all_history \
-        --out-dir /path/to/topiocqa_all_history
+    python -m scripts.data_prep.topiocqa \
+        --out-dir /path/to/topiocqa
 """
 
 from __future__ import annotations
@@ -142,17 +141,12 @@ def main():
     test_converted = _convert_examples(df_valid.to_dict("records"), "test", context_to_uid)
 
     print(f"\nUnique contexts across all splits: {len(context_to_uid)}")
-    cuid2text = [
-        {"context_uid": uid, "context": text} for text, uid in context_to_uid.items()
-    ]
-    cuid2text.sort(key=lambda x: x["context_uid"])
 
     retreever_data = DatasetDict(
         {
             "train": Dataset.from_list(train_converted),
             "val": Dataset.from_list(val_converted),
             "test": Dataset.from_list(test_converted),
-            "cuid2text": Dataset.from_list(cuid2text),
         }
     )
 
@@ -163,7 +157,7 @@ def main():
     print("\nDone. Summary:")
     for name, ds in retreever_data.items():
         print(f"  {name}: {len(ds)} rows")
-    print(f"\nKNOWN_DATASETS['topiocqa_all_history'] = {out_dir.resolve()}")
+    print(f"\nKNOWN_DATASETS['topiocqa'] = {out_dir.resolve()}")
 
 
 if __name__ == "__main__":

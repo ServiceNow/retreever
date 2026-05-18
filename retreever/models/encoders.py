@@ -52,7 +52,7 @@ class BaseEncoder(ABC, torch.nn.Module):
         elif tag == "ctx":
             self.prefix = "context: "
         else:
-            NotImplementedError(f"Unsupported tag value: {tag}")
+            raise ValueError(f"tag must be 'question' or 'ctx', got {tag!r}")
 
     @abstractmethod
     def forward(self):
@@ -509,14 +509,6 @@ class DinoV2Encoder(BaseEncoder):
         embeddings = self.forward(inputs["pixel_values"])
         
         return embeddings
-
-
-class DummyEncoder(torch.nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(DummyEncoder, self).__init__()
-
-    def forward(self, input_ids: torch.Tensor, *args, **kwargs):
-        return input_ids
 
 
 class ResNetProcessor:
@@ -1403,435 +1395,12 @@ class CLAPEncoder(BaseAudioEncoder):
         return embs
 
 
-class CLAPTextAudioEncoder(torch.nn.Module):
-    """Unified CLAP encoder for cross-modal text-audio retrieval (e.g. Clotho).
-
-    Mirrors FlavaEncoder / HybridDistilBERTCLIPEncoder:
-        - tag="question"  →  text tower:  ClapModel.get_text_features(...)  → 512D
-        - tag="ctx"       →  audio tower: ClapModel.get_audio_features(...) → 512D
-
-    The two instantiations share the same HuggingFace model weights, so no
-    parameter duplication occurs as long as they are created from the same
-    checkpoint.
-
-    Audio inputs are expected to arrive as raw float32 waveforms at 48000 Hz
-    (matching CLAP's native rate).  Use TextAudioRetrievalDataset with
-    sample_rate=48000 so resampling is done at load time.
-    """
-
-    def __init__(
-        self,
-        tag: str,
-        model_name: str = "laion/clap-htsat-fused",
-        cache_dir: str = None,
-        normalize: bool = True,
-        max_length: int = 77,
-        sample_rate: int = 44100,   # native sample rate of incoming audio (Clotho=44100)
-        token_level: bool = False,
-        *args,
-        **kwargs,
-    ):
-        """
-        Args:
-            tag: "question" for text queries, "ctx" for audio contexts.
-            model_name: "laion/clap-htsat-fused" or "laion/clap-htsat-unfused".
-            cache_dir: HuggingFace cache directory.
-            normalize: L2-normalise output embeddings.
-            max_length: Max token length for text inputs.
-            sample_rate: Sample rate of incoming audio tensors (default 48000).
-
-        Models:
-            clap-htsat-fused  : 112M params, 512-dim embeddings (recommended)
-            clap-htsat-unfused: 138M params, 512-dim embeddings
-        """
-        super(CLAPTextAudioEncoder, self).__init__()
-
-        try:
-            from transformers import ClapModel, ClapProcessor
-        except ImportError:
-            raise ImportError(
-                "CLAPTextAudioEncoder requires transformers>=4.30. "
-                "Install with: pip install transformers"
-            )
-
-        self.tag = tag
-        self.normalize = normalize
-        self.sample_rate = sample_rate
-        self.token_level = token_level
-        self.prefix = ""
-        self.output_size = 768  # pre-projection hidden dim of both CLAP towers
-
-        self.model = ClapModel.from_pretrained(model_name, cache_dir=cache_dir)
-        self.processor = ClapProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-
-        if tag == "question":
-            # Expose the tokenizer so the text-side collator can use it.
-            self.tokenizer = self.processor.tokenizer
-            self.tokenizer.model_max_length = max_length
-        elif tag == "ctx":
-            # ClapProcessor accepts any sampling_rate and internally resamples
-            # to the 48 kHz that CLAP requires, so no manual resampling is needed.
-            # print(
-            #     f"CLAPTextAudioEncoder (ctx): incoming audio sample_rate={sample_rate} Hz. "
-            #     f"ClapProcessor will resample to 48000 Hz internally."
-            # )
-            pass
-        else:
-            raise ValueError(f"Unknown tag '{tag}'. Use 'question' or 'ctx'.")
-
-    def _normalize_emb(self, embs: torch.Tensor) -> torch.Tensor:
-        if self.normalize:
-            import torch.nn.functional as F
-            embs = F.normalize(embs, p=2, dim=-1)
-        return embs
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Unified forward dispatching on self.tag.
-
-        Both paths return 768D features (pre-projection hidden dim of each tower),
-        bypassing CLAP's ClapProjectionLayer (768→512 MLP) entirely.
-
-        For tag="question":
-            input_ids      : (B, seq_len) tokenized text
-            attention_mask : (B, seq_len) attention mask
-            token_level=False → (B, 768)    pooler_output (tanh-projected CLS)
-            token_level=True  → (B, L, 768) last_hidden_state
-
-        For tag="ctx":
-            input_ids      : (B, num_samples) float32 waveform at self.sample_rate Hz
-            attention_mask : ignored
-            token_level=False → (B, 768)    pooler_output (HTSAT attention pooling)
-            token_level=True  → (B, T, 768) last_hidden_state
-        """
-        if self.tag == "question":
-            text_outputs = self.model.text_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            if self.token_level:
-                embs = text_outputs.last_hidden_state  # (B, L, 768)
-            else:
-                embs = text_outputs.pooler_output      # (B, 768)
-
-        else:  # tag == "ctx"
-            # input_ids here is the waveform tensor (B, num_samples) already at
-            # 48000 Hz — resampling is handled by TextAudioRetrievalDataset.
-            waveforms = input_ids
-
-            if waveforms.dim() > 2:
-                # -------------------------------------------------------
-                # Fast path: pre-computed mel spectrograms from DataLoader
-                # workers (shape B×C×F×T for fused, B×1×F×T for unfused).
-                # Skip the CPU ClapProcessor call entirely — GPU is never
-                # blocked by mel spectrogram computation.
-                # -------------------------------------------------------
-                model_dtype = next(self.model.parameters()).dtype
-                input_features = waveforms.to(device=waveforms.device, dtype=model_dtype)
-                # Always mark every sample as "longer" so the full batch goes
-                # through CLAP's fusion path together.  This avoids BatchNorm
-                # failures when only 1 sample in the batch would be "longer".
-                is_longer = torch.ones(input_features.shape[0], dtype=torch.bool,
-                                       device=input_features.device)
-                audio_kwargs = {
-                    "input_features": input_features,
-                    "is_longer":      is_longer.to(device=input_features.device),
-                }
-                audio_outputs = self.model.audio_model(**audio_kwargs)
-
-            else:
-                # -------------------------------------------------------
-                # Legacy path: raw waveforms — call ClapProcessor on CPU.
-                # Slow: mel spectrogram happens on the main training thread.
-                # Prefer using feature_extractor=... in TextAudioRetrievalDataset.
-                # -------------------------------------------------------
-                waveforms_np = waveforms.cpu().float().numpy()
-
-                inputs = self.processor(
-                    audios=waveforms_np,
-                    sampling_rate=48000,
-                    return_tensors="pt",
-                )
-                model_dtype = next(self.model.parameters()).dtype
-                inputs = {k: v.to(device=waveforms.device, dtype=model_dtype if v.is_floating_point() else v.dtype)
-                          for k, v in inputs.items()}
-                # Override is_longer to all-True (same reason as fast path above).
-                inputs["is_longer"] = torch.ones(waveforms.shape[0], dtype=torch.bool,
-                                                  device=waveforms.device)
-                audio_outputs = self.model.audio_model(**inputs)
-            if self.token_level:
-                # HTSAT last_hidden_state is (B, C, freq, time) — a 4D spatial map.
-                # Reshape to (B, freq*time, C) so the tree/split_fn sees (B, T, D).
-                lhs = audio_outputs.last_hidden_state   # (B, C, F, T)
-                B, C, F, T = lhs.shape
-                embs = lhs.permute(0, 2, 3, 1).reshape(B, F * T, C)  # (B, F*T, C)
-            else:
-                embs = audio_outputs.pooler_output      # (B, 768)
-
-        return self._normalize_emb(embs)
-
-
-from transformers import FlavaModel, FlavaProcessor
-
-class FlavaEncoder(BaseEncoder):
-    def __init__(
-        self,
-        tag: str,  # "question" for text, "ctx" for image
-        model_name: str = "facebook/flava-full",
-        cache_dir: str = None,
-        token_level: bool = False,
-        normalize: bool = True,
-        max_length: int = 77,
-        *args,
-        **kwargs,
-    ):
-        """Unified FLAVA encoder for both text and images.
-
-        Args:
-            tag (str): "question" for text encoding, "ctx" for image encoding
-            model_name (str): HuggingFace model name
-            cache_dir (str): Cache directory
-            token_level (bool): 
-                - False: return pooled features (CLS token) - 768D
-                - True: return per-token/patch embeddings - (seq_len/num_patches, 768)
-            normalize (bool): Whether to L2-normalize embeddings
-            max_length (int): Max sequence length for text
-        """
-        torch.nn.Module.__init__(self)
-        
-        self.tag = tag
-        self.model = FlavaModel.from_pretrained(model_name, cache_dir=cache_dir)
-        self.processor = FlavaProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-        
-        # Set up tokenizer for text mode
-        if tag == "question":
-            self.tokenizer = self.processor.tokenizer
-        
-        # FLAVA has 768D for both text and vision
-        self.output_size = 768
-        self.token_level = token_level
-        self.normalize = normalize
-        self.max_length = max_length
-        self.prefix = ""
-        
-    def forward(self, input_ids: torch.Tensor = None, pixel_values: torch.Tensor = None, 
-                attention_mask: torch.Tensor = None, **kwargs):
-        """Unified forward that handles both text and images based on tag.
-        
-        Args:
-            input_ids: Tokenized text (for tag="question")
-            pixel_values: Preprocessed images (for tag="ctx")
-            attention_mask: Attention mask for text (for tag="question")
-
-        Returns:
-            torch.Tensor: Embeddings (768D pooled or token/patch-level)
-        """
-        
-        if self.tag == "question":
-            # Text encoding path
-            text_outputs = self.model.get_text_features(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_dict=True,
-            )
-            
-            if self.token_level:
-                embs = text_outputs  # Shape: (B, seq_len, 768)
-            else:
-                embs = text_outputs[:, 0, :]  # Shape: (B, 768) - CLS token
-                
-        elif self.tag == "ctx":
-            # Image encoding path
-            model_dtype = next(self.model.parameters()).dtype
-            if input_ids.dtype != model_dtype:
-                input_ids = input_ids.to(model_dtype)
-            image_outputs = self.model.get_image_features(
-                pixel_values=input_ids,
-                return_dict=True,
-            )
-            
-            if self.token_level:
-                embs = image_outputs  # Shape: (B, num_patches + 1, 768)
-            else:
-                embs = image_outputs[:, 0, :]  # Shape: (B, 768) - CLS token
-        else:
-            raise ValueError(f"Unknown tag: {self.tag}. Must be 'question' or 'ctx'")
-        
-        embs = self._normalize(embs)
-        return embs
-    
-    def encode_images(
-        self,
-        images: List[Union[Image.Image, str]],
-        device: str = "cpu",
-    ):
-        """Encode images for evaluation (only works if tag="ctx").
-        
-        Args:
-            images: List of PIL Images or paths to images
-            device: Device to run inference on
-        """
-        if self.tag != "ctx":
-            raise ValueError("encode_images only works with tag='ctx'")
-        
-        # Load images if paths are provided
-        loaded_images = []
-        for img in images:
-            if isinstance(img, str):
-                loaded_images.append(Image.open(img).convert('RGB'))
-            else:
-                loaded_images.append(img)
-        
-        # Preprocess images
-        inputs = self.processor(images=loaded_images, return_tensors="pt").to(device)
-        
-        # Get embeddings
-        embeddings = self.forward(pixel_values=inputs["pixel_values"])
-        
-        return embeddings
-
-class HybridDistilBERTCLIPEncoder(BaseEncoder):
-    def __init__(
-        self,
-        tag: str,  # "question" for text, "ctx" for image
-        model_name: str = None,  # Not used, kept for interface compatibility
-        cache_dir: str = None,
-        token_level: bool = False,
-        normalize: bool = True,
-        max_length: int = 512,
-        *args,
-        **kwargs,
-    ):
-        """Hybrid encoder using DistilBERT for text and CLIP for images.
-
-        Args:
-            tag (str): "question" for text encoding, "ctx" for image encoding
-            model_name (str): Ignored, kept for interface compatibility
-            cache_dir (str): Cache directory
-            token_level (bool): 
-                - False: return pooled features - 768D
-                - True: return per-token/patch embeddings
-            normalize (bool): Whether to L2-normalize embeddings
-            max_length (int): Max sequence length for text
-        """
-        torch.nn.Module.__init__(self)
-        
-        self.tag = tag
-        self.token_level = token_level
-        self.normalize = normalize
-        self.max_length = max_length
-        self.prefix = ""
-        
-        # Both output 768D
-        self.output_size = 768
-        
-        if tag == "question":
-            # Load DistilBERT for text
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "sentence-transformers/msmarco-distilbert-cos-v5",
-                model_max_length=max_length
-            )
-            self.model = AutoModel.from_pretrained(
-                "sentence-transformers/msmarco-distilbert-cos-v5",
-                cache_dir=cache_dir
-            )
-        elif tag == "ctx":
-            # Load CLIP for images
-            self.model = CLIPModel.from_pretrained(
-                "openai/clip-vit-base-patch32",
-                cache_dir=cache_dir
-            )
-            self.processor = CLIPProcessor.from_pretrained(
-                "openai/clip-vit-base-patch32",
-                cache_dir=cache_dir
-            )
-        else:
-            raise ValueError(f"Unknown tag: {tag}. Must be 'question' or 'ctx'")
-        
-        for param in self.model.parameters():
-            param.data = param.data.contiguous()
-    
-    def forward(self, input_ids: torch.Tensor = None, pixel_values: torch.Tensor = None,
-                attention_mask: torch.Tensor = None, **kwargs):
-        """Unified forward that handles both text and images based on tag.
-        
-        Args:
-            input_ids: Tokenized text (for tag="question") or pixel values (for tag="ctx")
-            pixel_values: Not used, kept for compatibility
-            attention_mask: Attention mask for text (for tag="question")
-
-        Returns:
-            torch.Tensor: Embeddings (768D pooled or token/patch-level)
-        """
-        
-        if self.tag == "question":
-            # Text encoding with DistilBERT
-            embs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)[0]
-            
-            if not self.token_level:  # Mean pooling for sentence embeddings
-                input_mask_expanded = attention_mask.unsqueeze(-1).expand(embs.size()).float()
-                sum_embeddings = torch.sum(embs * input_mask_expanded, 1)
-                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-                embs = sum_embeddings / sum_mask
-                
-        elif self.tag == "ctx":
-            # Image encoding with CLIP
-            vision_outputs = self.model.vision_model(
-                pixel_values=input_ids,  # input_ids contains pixel_values for images
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            
-            if self.token_level:
-                # Return all patch embeddings
-                embs = vision_outputs.last_hidden_state
-            else:
-                # Return pooled output (CLS token)
-                embs = vision_outputs.pooler_output
-        
-        embs = self._normalize(embs)
-        model_dtype = next(self.model.parameters()).dtype
-        if embs.dtype != model_dtype:
-            embs = embs.to(model_dtype)
-            
-        return embs
-    
-    def encode_images(
-        self,
-        images: List[Union[Image.Image, str]],
-        device: str = "cpu",
-    ):
-        """Encode images for evaluation (only works if tag="ctx").
-        
-        Args:
-            images: List of PIL Images or paths to images
-            device: Device to run inference on
-        """
-        if self.tag != "ctx":
-            raise ValueError("encode_images only works with tag='ctx'")
-        
-        # Load images if paths are provided
-        loaded_images = []
-        for img in images:
-            if isinstance(img, str):
-                loaded_images.append(Image.open(img).convert('RGB'))
-            else:
-                loaded_images.append(img)
-        
-        # Preprocess images
-        inputs = self.processor(images=loaded_images, return_tensors="pt").to(device)
-        
-        # Get embeddings
-        embeddings = self.forward(input_ids=inputs["pixel_values"])
-        
-        return embeddings
-
-
 def get_encoders(encoder_type, **encoder_kwargs):
+    """Build a (query_encoder, context_encoder) pair for the given encoder_type.
+
+    ``encoder_type`` must be a key in :data:`encoder_dict`.  Extra keyword
+    arguments are forwarded to the encoder constructor.
+    """
     model_name = encoder_dict[encoder_type][1]
     context_encoder = encoder_dict[encoder_type][0](
         tag="ctx", model_name=model_name, **encoder_kwargs
@@ -1839,48 +1408,28 @@ def get_encoders(encoder_type, **encoder_kwargs):
     query_encoder = encoder_dict[encoder_type][0](
         tag="question", model_name=model_name, **encoder_kwargs
     )
-
     return query_encoder, context_encoder
 
 
 def merge_lora_weights(checkpoint_path, query_encoder, context_encoder, lora_alpha=16, lora_r=8):
-    """
-    Load checkpoint with LoRA weights and merge them into the encoders.
-    
-    Args:
-        checkpoint_path: Path to the checkpoint file
-        query_encoder: Your query encoder model
-        context_encoder: Your context encoder model
-        lora_alpha: LoRA alpha parameter (scaling factor)
-        lora_r: LoRA rank
-    """
-    # Load checkpoint
+    """Load a checkpoint with LoRA weights and merge them into the encoders."""
     state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
-    
-    # Calculate LoRA scaling factor
     lora_scaling = lora_alpha / lora_r
-    
-    # Process each encoder
-    for encoder_name, encoder_model in [('query_encoder', query_encoder), 
-                                          ('context_encoder', context_encoder)]:
+
+    for encoder_name, encoder_model in [
+        ('query_encoder', query_encoder),
+        ('context_encoder', context_encoder),
+    ]:
         print(f"\nProcessing {encoder_name}...")
-        
-        # Organize weights by parameter name
         base_weights = {}
         lora_a_weights = {}
         lora_b_weights = {}
-        other_weights = {}
-        
-        # Separate different types of weights
+
         for key, value in state_dict.items():
             if not key.startswith(encoder_name):
                 continue
-                
-            # Remove encoder prefix to get model-relative key
             relative_key = key[len(encoder_name) + 1:]  # +1 for the dot
-            
             if '.lora_A.default.weight' in key:
-                # Extract base parameter name
                 base_key = relative_key.replace('.lora_A.default.weight', '.weight')
                 lora_a_weights[base_key] = value
             elif '.lora_B.default.weight' in key:
@@ -1893,156 +1442,38 @@ def merge_lora_weights(checkpoint_path, query_encoder, context_encoder, lora_alp
                 base_key = relative_key.replace('.base_layer.bias', '.bias')
                 base_weights[base_key] = value
             else:
-                # Regular weights without LoRA
                 base_weights[relative_key] = value
-        
-        # Merge LoRA weights into base weights
+
         merged_state_dict = {}
-        
         for key, base_weight in base_weights.items():
             if key in lora_a_weights and key in lora_b_weights:
-                # Merge: W_merged = W_base + scaling * (B @ A)
-                lora_a = lora_a_weights[key]
-                lora_b = lora_b_weights[key]
-                
-                # Compute LoRA update: B @ A
-                lora_update = (lora_b @ lora_a) * lora_scaling
-                
-                # Merge with base weights
-                merged_weight = base_weight + lora_update
-                merged_state_dict[key] = merged_weight
-                print(f"  Merged LoRA for {key}: {base_weight.shape} + {lora_update.shape}")
+                lora_update = (lora_b_weights[key] @ lora_a_weights[key]) * lora_scaling
+                merged_state_dict[key] = base_weight + lora_update
+                print(f"  Merged LoRA for {key}: {base_weight.shape}")
             else:
-                # No LoRA adaptation for this parameter
                 merged_state_dict[key] = base_weight
-        
-        # Load merged weights into encoder
-        # Remove 'base_model.model.' prefix if present to match encoder structure
-        clean_state_dict = {}
-        for key, value in merged_state_dict.items():
-            if key.startswith('base_model.model.'):
-                clean_key = key[len('base_model.model.'):]
-                clean_state_dict[clean_key] = value
-            else:
-                clean_state_dict[key] = value
-        
-        # Load into model
-        missing_keys, unexpected_keys = encoder_model.load_state_dict(clean_state_dict, strict=False)
-        
+
+        # Drop the "base_model.model." prefix that PEFT adds, so keys match the
+        # raw encoder's parameter names.
+        clean_state_dict = {
+            (k[len('base_model.model.'):] if k.startswith('base_model.model.') else k): v
+            for k, v in merged_state_dict.items()
+        }
+
+        missing_keys, unexpected_keys = encoder_model.load_state_dict(
+            clean_state_dict, strict=False
+        )
         print(f"  Loaded {len(clean_state_dict)} parameters into {encoder_name}")
         if missing_keys:
-            print(f"  Missing keys: {missing_keys[:5]}..." if len(missing_keys) > 5 else f"  Missing keys: {missing_keys}")
+            print(f"  Missing keys (first 5): {missing_keys[:5]}")
         if unexpected_keys:
-            print(f"  Unexpected keys: {unexpected_keys[:5]}..." if len(unexpected_keys) > 5 else f"  Unexpected keys: {unexpected_keys}")
-    
-    print("\n✓ Successfully loaded and merged LoRA weights!")
+            print(f"  Unexpected keys (first 5): {unexpected_keys[:5]}")
+
+    print("\nSuccessfully loaded and merged LoRA weights.")
     return query_encoder, context_encoder
 
 
-class MultiModalContextEncoder(torch.nn.Module):
-    """Multi-modal encoder for simultaneous text-image and text-audio retrieval.
-
-    Used with encoder_type="multimodal-dino-ast" to train a shared tree over
-    Clotho (text→audio) + COCO (text→image) + Flickr30k (text→image).
-
-    tag="question"  → DistilBERT (768D) for all text queries.  Exposes .tokenizer.
-    tag="ctx"       → DINOv2-base (768D) for images, AST (768D) for audio.
-                      Both sub-encoders are always frozen.
-                      forward() requires modality="image" or modality="audio".
-    """
-
-    def __init__(
-        self,
-        tag: str,
-        model_name: str = None,          # ignored; kept for get_encoders() compat
-        cache_dir: str = None,
-        token_level: bool = False,
-        normalize: bool = True,
-        max_length: int = 512,
-        image_model_name: str = "facebook/dinov2-base",
-        audio_model_name: str = "MIT/ast-finetuned-audioset-10-10-0.4593",
-        audio_sample_rate: int = 48000,
-        *args,
-        **kwargs,
-    ):
-        torch.nn.Module.__init__(self)
-        self.tag = tag
-        self.token_level = token_level
-        self.normalize = normalize
-        self.prefix = ""
-        self.output_size = 768  # DINOv2-base, AST, and DistilBERT all output 768D
-
-        if tag == "question":
-            self._encoder = DistilBERTEncoder(
-                tag="question",
-                model_name="sentence-transformers/msmarco-distilbert-cos-v5",
-                cache_dir=cache_dir,
-                token_level=token_level,
-                normalize=normalize,
-                max_length=max_length,
-            )
-            self.tokenizer = self._encoder.tokenizer
-
-        elif tag == "ctx":
-            self.image_encoder = DinoV2Encoder(
-                tag="ctx",
-                model_name=image_model_name,
-                cache_dir=cache_dir,
-                token_level=token_level,
-                normalize=normalize,
-            )
-            self.audio_encoder = ASTEncoder(
-                tag="ctx",
-                model_name=audio_model_name,
-                cache_dir=cache_dir,
-                token_level=token_level,
-                normalize=normalize,
-                sample_rate=audio_sample_rate,
-            )
-            # Both sub-encoders are always frozen
-            for param in self.image_encoder.parameters():
-                param.requires_grad = False
-            for param in self.audio_encoder.parameters():
-                param.requires_grad = False
-
-        else:
-            raise ValueError(f"Unknown tag '{tag}'. Use 'question' or 'ctx'.")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        modality: str = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Dispatch to text, image, or audio sub-encoder based on tag/modality.
-
-        For tag="question":
-            Standard text forward — input_ids are token ids, attention_mask is used.
-        For tag="ctx":
-            modality="image" → input_ids contains pixel_values → DINOv2Encoder
-            modality="audio" → input_ids contains waveform tensor → ASTEncoder
-        """
-        if self.tag == "question":
-            return self._encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **kwargs,
-            )
-        else:  # ctx
-            if modality == "image":
-                return self.image_encoder(pixel_values=input_ids)
-            elif modality == "audio":
-                return self.audio_encoder(pixel_values=input_ids)
-            else:
-                raise ValueError(
-                    f"MultiModalContextEncoder (ctx) requires modality='image' or "
-                    f"'audio', got {modality!r}"
-                )
-
-
 encoder_dict = {  # supported encoder modules
-    "dummy": (DummyEncoder, ""),
     "bert": (BertEncoder, "bert-base-uncased"),
     "bge": (BGEEncoder, "BAAI/bge-large-en-v1.5"),
     "bgem3": (BGEEncoder, "BAAI/bge-m3"),
@@ -2085,14 +1516,4 @@ encoder_dict = {  # supported encoder modules
     
     "clap-fused": (CLAPEncoder, "laion/clap-htsat-fused"),     # 112M params, 512-dim (recommended)
     "clap-unfused": (CLAPEncoder, "laion/clap-htsat-unfused"), # 138M params, 512-dim
-    # Text-Audio encoders (text query → audio context, e.g. Clotho)
-    "clap-fused-ta": (CLAPTextAudioEncoder, "laion/clap-htsat-fused"),     # 112M, 512-dim
-    "clap-unfused-ta": (CLAPTextAudioEncoder, "laion/clap-htsat-unfused"), # 138M, 512-dim
-    # Text-Image encoders
-    'flava': (FlavaEncoder, 'facebook/flava-full'), # ~245M params, 768-dim
-    'hybrid-distilbert-clip': (HybridDistilBERTCLIPEncoder, None),  # model_name not used
-    # Multi-modal: DistilBERT (text query) + DINOv2-base (image ctx) + AST (audio ctx)
-    # Trains simultaneously on Clotho (text→audio) + COCO/Flickr30k (text→image)
-    'multimodal-dino-ast': (MultiModalContextEncoder, None),  # 768D, both ctx sub-encoders frozen
-
 }

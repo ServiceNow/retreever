@@ -3,7 +3,7 @@ defaults:
   - train: retreever
   - logging: wandb
 
-dataset: "nq"
+dataset: "hotpotqa"
 debug: False
 ckpt: null
 seed: null

@@ -131,6 +131,16 @@ def total_variation_distance_matrix(pred, target):
     return -0.5 * torch.cdist(pred.float(), target.float(), p=1)
 
 
+# Registry of pairwise similarity measures used by the various loss terms.
+# Keys must match the strings accepted by ``cfg.model.sim_measure`` (see
+# ``scripts/config/model/retreever.yaml``).
+sim_measure_dict = {
+    "ce": matrix_neg_cross_entropy,
+    "cos_sim": cosine_similarity_matrix,
+    "tvd": total_variation_distance_matrix,
+}
+
+
 class ContrastiveLoss(torch.nn.Module):
     def __init__(
         self,
@@ -1085,51 +1095,6 @@ class TreeLocalityLoss(torch.nn.Module):
         
         return expected_distances.mean()
     
-class Balance(torch.nn.Module):
-    def __init__(self, args_idx_to_eval: int = 0):
-        """Negative tre Shannon entropy.
-
-        Args:
-            args_idx_to_eval (int, optional): Index of argument passed to __call__ to evaluate balance. Defaults to 0.
-        """
-
-        super(Balance, self).__init__()
-
-        self.args_idx = args_idx_to_eval
-
-    def __call__(
-        self,
-        *args,
-        eps: float = 1e-10,
-    ) -> torch.Tensor:
-        logits = args[self.args_idx]
-        probs = logits / logits.sum(1, keepdim=True)
-
-        return (probs * torch.log(probs + eps)).mean(0).sum()
-
-
-class Sharpness(torch.nn.Module):
-    def __init__(self, args_idx_to_eval: int = 0):
-        """Negative L2 loss to encourage sharpness.
-
-        Args:
-            args_idx_to_eval (int, optional): Index of argument passed to __call__ to evaluate sharpness. Defaults to 0.
-        """
-
-        super(Sharpness, self).__init__()
-
-        self.args_idx = args_idx_to_eval
-
-    def __call__(
-        self,
-        *args,
-    ) -> torch.Tensor:
-        logits = args[self.args_idx]
-        probs = logits / logits.sum(1, keepdim=True)
-
-        return -(probs**2).sum(1).mean()
-
-
 class CompositeLoss(torch.nn.Module):
     def __init__(
         self,
@@ -1357,102 +1322,3 @@ class TripletLoss(torch.nn.Module):
         return losses.mean()
 
 
-class TripletLossAllNegatives(torch.nn.Module):
-    """Alternative: Average over all negatives instead of just hardest."""
-    
-    def __init__(
-        self,
-        margin: float = 0.2,
-        local_loss: bool = False,
-        freeze_tmp: bool = False,
-        sim_measure: str = "ce",
-        max_tmp: float = 30.0,
-        use_learnable_temp: bool = False,
-        encoder_dim: int = 1024,
-    ):
-        super(TripletLossAllNegatives, self).__init__()
-
-        self.margin = margin
-        self.local_loss = local_loss
-        self.sim_measure = sim_measure
-        self.use_learnable_temp = use_learnable_temp
-        self.encoder_dim = encoder_dim
-        
-        if self.use_learnable_temp:
-            self.temp_param = TempCoef(initial_value=1.0, max_tmp=max_tmp)
-            if freeze_tmp:
-                self.temp_param.temp_coef.requires_grad = False
-
-    def __call__(
-        self,
-        q_embs: torch.Tensor,
-        c_embs: torch.Tensor,
-        depth: torch.Tensor,
-    ) -> torch.Tensor:
-        """Computes triplet loss averaged over all negatives.
-        
-        Args:
-            q_embs: Query representations [batch_size, dim]
-            c_embs: Context representations [batch_size, dim]
-            depth: Current depth level (for hierarchical models)
-            
-        Returns:
-            Triplet loss value
-        """
-        # Extract the relevant slice based on depth
-        _, d = q_embs.shape
-        depth_val = depth.item()
-        
-        start_index = 2 ** depth_val - 1
-        end_index = 2 ** (depth_val + 1) - 1
-        
-        q_embs = q_embs[:, start_index:end_index]
-        c_embs = c_embs[:, start_index:end_index]
-        
-        if self.local_loss:
-            q_embs_all = q_embs
-            c_embs_all = c_embs
-        else:
-            q_embs_all = all_gather(q_embs.contiguous())
-            c_embs_all = all_gather(c_embs.contiguous())
-
-        # Compute similarity matrix
-        qc_sim_matrix = sim_measure_dict[self.sim_measure](q_embs_all, c_embs_all)
-        
-        if self.use_learnable_temp:
-            self.temp_param = self.temp_param.to(qc_sim_matrix.device)
-            qc_sim_matrix = self.temp_param(qc_sim_matrix)
-        
-        # Convert to distances (negative similarity)
-        qc_distance_matrix = -qc_sim_matrix
-        
-        # Get indices
-        positive_idx = torch.arange(qc_distance_matrix.size(0)).long().to(qc_distance_matrix.device)
-        if not self.local_loss:
-            positive_idx = positive_idx + dist.get_rank() * q_embs.size(0)
-        
-        # Distance to positive
-        dist_qp = qc_distance_matrix[torch.arange(q_embs_all.size(0)), positive_idx]
-        
-        # Average over all negatives
-        mask = torch.ones_like(qc_distance_matrix, dtype=torch.bool)
-        mask[torch.arange(q_embs_all.size(0)), positive_idx] = False
-        
-        # Compute triplet loss for all negatives and average
-        dist_qp_expanded = dist_qp.unsqueeze(1)  # [batch_size, 1]
-        triplet_losses = F.relu(dist_qp_expanded - qc_distance_matrix + self.margin)
-        
-        # Zero out the positive pairs
-        triplet_losses = triplet_losses.masked_fill(~mask, 0.0)
-        
-        # Average over all negatives
-        num_negatives = mask.sum(dim=1).float()
-        loss = (triplet_losses.sum(dim=1) / num_negatives).mean()
-        
-        return loss
-
-sim_measure_dict = {
-    "ce": matrix_neg_cross_entropy,
-    "tvd": total_variation_distance_matrix,
-    "cos_sim": cosine_similarity_matrix,
-}

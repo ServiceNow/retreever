@@ -1,4 +1,4 @@
-from retreever.evaluation import Metric
+from retreever.evaluation.base import Metric
 from typing import List
 import math
 
@@ -13,7 +13,7 @@ class HitK(Metric):
         if self.args and hasattr(self.args, "k"):
             self.k = self.args.k
         else:
-            raise ("You need to specify an integer value for k for the Hit@k metric")
+            raise ValueError("You need to specify an integer value for k for the Hit@k metric")
 
     def _compute(self, predicted_ids: List, gt_ids: List):
         """

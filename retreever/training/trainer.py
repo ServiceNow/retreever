@@ -11,7 +11,7 @@ from typing import Optional, Dict
 
 from retreever.models.retreever import ReTreever
 from retreever.evaluation.retreeval_metrics import retreeval_metrics
-from retreever.evaluation.utils import RetEvaluator
+from retreever.evaluation.evaluator import RetEvaluator
 from retreever.training.depth_schedulers import KNOWN_SCHEDULERS, RandomDepthScheduler
 from retreever.utils.jobs import omegaconf_to_dict
 
