@@ -57,9 +57,9 @@ results/
 *.pth
 *.bin
 
-# Configuration with sensitive paths
-# Users should copy config_template.py to config.py
-retreever/config.py
+# Local machine-specific paths.
+# Users copy local_paths.py.example to local_paths.py and fill in their paths.
+/local_paths.py
 
 # Data directories (too large to commit)
 data/

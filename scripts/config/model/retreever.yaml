@@ -1,37 +1,46 @@
-# ReTreever model configuration
-
-# Encoder settings
-encoder_type: "distilbert"  # Options: distilbert, bge, dinov2-large, resnet50, clip-vit-large-patch14, ast, flava
+encoder_type: "bge"
 encoder_context_length: 512
-encoder_token_level: true
-encoder_normalize: false
-encoder_dim: 768
-
-# Tree settings
-tree_type: "no_propagation_tree"  # Options: no_propagation_tree, probabilistic_tree, no_tree
+encoder_pad_token: "[PAD]"
+encoder_token_level: True  # whether using token level or sentence level embeddings
+encoder_dim: 1024
+tree_type: "no_propagation_tree"
+tree_split_fn: "cross_attn"
+dual_model: False # whether using different encoder-tree pairs for context and for question, or the same
 tree_depth: 10
-tree_split_fn: "cross_attn"  # Options: cross_attn, mlp, linear
-
-# Dual model (separate query/context encoders)
-dual_model: false
-
-# Training settings
-freeze_encoder: true
-train_full_tree_rep: false
-
-# Split function parameters
+freeze_encoder: True # whether finetuning the encoder
+encoder_normalize: False
+sim_measure: "tvd"
 split_fn_embedding_dim: 768
 num_embeddings_per_node: 1
 cross_attn_scoring_fn_name: "propagate_single_mlp"
 split_fn_d_k: 512
 split_fn_n_heads: 8
-
-# Evaluation
 eval_strategy: "faiss_tree_rep"
-
-# Loss
-loss_type: "contrastive"  # Options: contrastive, multi_label_contrastive, mrl
-sim_measure: "cos_sim"  # Options: cos_sim, tvd
-
-# Advanced settings (usually not changed)
+train_full_tree_rep: False
+loss_type: "contrastive"
+use_sigmoid_in_projection: False
+attend_ne_only_on_text: False
+enable_llm_split_score_prop: False
+token_mixer_type: "none"
+finetuned_encoder_path: null
 node_embedding_strategy: "independent"
+treat_attn_as_residual: false
+have_ffn_layer: false
+lock_in_query_encoder: false
+lock_in_context_encoder: false
+vq_residual: false
+use_simvq: false
+dropout_location: "inside_split"
+path_loss_tmp: 0.1
+path_loss_all_levels: false
+margin: 0.2
+use_dynamic_margin: false
+encoder_finetune_strategy: "none"
+finetuned_encoder_checkpoint: null
+freeze_finetuned_components: true
+num_cross_attn_queries: 10
+# Tree adapter for cross-dataset transfer (empty = disabled)
+tree_adapter_targets: []
+tree_adapter_lora_r: 8
+tree_adapter_lora_alpha: 16
+tree_adapter_logit_type: "scalar"

@@ -9,6 +9,8 @@ from typing import Tuple
 from retreever.models.split_functions import split_dict
 from retreever.utils.algo import BinarySearchTree
 
+# ----------------------------------------------------------------------- TREE MODULES
+
 
 class Tree(torch.nn.Module):
     def __init__(
@@ -24,7 +26,7 @@ class Tree(torch.nn.Module):
         Args:
             input_size (Tuple[int]): size of inputs to route, e.g., (embedding_dim,) or (num_tokens, embedding_dim). Inputs will be flattened.
             depth (int): depth of the tree
-            split_fn (str): type of split function. Supported options are provided in split_functions.split_dict
+            split_fn (str): type of split function. Supported options are provided in retreever.models.split_functions.split_dict
         """
         super(Tree, self).__init__()
 
@@ -256,7 +258,6 @@ class NoTree(torch.nn.Module):
         """
         super(NoTree, self).__init__()
 
-        # self.num_leaves = input_size  # maximal MRL dimension is equal to embedding size
         self.num_leaves = 2 ** split_fn_params.get("depth")
         # ignore depth param, as not needed for this flat tree
         split_fn_params.pop("depth", None)
@@ -325,6 +326,8 @@ class NoPropagationTree(Tree):
         super(NoPropagationTree, self).__init__(
             input_size, depth, split_fn, needs_propagation=self.prod_bound_in_split, **split_fn_params
         )
+        
+        self.dropout_location = split_fn_params.get("dropout_location", "inside_split")
 
         self.depth = depth
         self.temp_coeff = torch.nn.Parameter(torch.tensor(0.0))  # Learnable temperature
@@ -334,7 +337,12 @@ class NoPropagationTree(Tree):
 
     def _compute_tree_scores(self, x: torch.Tensor, mask: torch.Tensor):
         """Returns the tree evaluations of the points. Each dimension i is the output of the i-th split function, upper bounded by the ancestors' split function outputs."""
+        # compute split outputs
+        # split_scores = self.dropout(self.split(x, mask))
         split_scores = self.split(x, mask)[0]
+        
+        if self.dropout_location in ["after_split", "both"]:
+            split_scores = self.dropout(split_scores)
         
         if self.prod_bound_in_split:
             return split_scores
@@ -355,7 +363,42 @@ class NoPropagationTree(Tree):
             start = end
 
         return bounded_scores
+        # Initialize bounded_scores with the same shape as split_scores.
+        
+        # (Assumes total nodes = 2^(depth+1) - 1)
+        # bounded_scores = torch.zeros(split_scores.shape, device=split_scores.device)
 
+        # # Compute indices for the last level:
+        # # Last level: indices [2**self.depth - 1, 2**(self.depth+1) - 1)
+        # start_last = 2 ** self.depth - 1
+        # end_last = 2 ** (self.depth + 1) - 1
+
+        # # Normalize only the last level with softmax.
+        # bounded_scores[:, start_last:end_last] = torch.softmax(
+        #     split_scores[:, start_last:end_last] * torch.exp(self.temp_coeff).clamp(1e-4, 30.0), dim=-1
+        # )
+
+        # # Now, propagate scores upward level-by-level.
+        # # For each non-leaf level (from level self.depth-1 down to level 0):
+        # for level in reversed(range(self.depth)):
+        #     # Determine the parent's indices for this level.
+        #     # For level 0: indices [0, 1), for level i (> 0): indices [2**level - 1, 2**(level+1) - 1)
+        #     start_parent = 2 ** level - 1
+        #     end_parent = 2 ** (level + 1) - 1
+
+        #     # Child level (immediately below) indices:
+        #     start_child = 2 ** (level + 1) - 1
+        #     end_child = 2 ** (level + 2) - 1
+        #     num_parents = 2 ** level
+        #     # Number of children should be 2 * num_parents.
+        #     # Extract child scores and reshape: shape -> (batch_size, num_parents, 2)
+        #     child_scores = bounded_scores[:, start_child:end_child].view(bounded_scores.size(0), num_parents, 2)
+        #     # Sum the two children scores for each parent.
+        #     parent_scores = child_scores.sum(dim=-1)  # shape: (batch_size, num_parents)
+        #     # Assign these sums to the parent's positions.
+        #     bounded_scores[:, start_parent:end_parent] = parent_scores
+
+        # return bounded_scores
     
 
 class IdentityTree(torch.nn.Module):

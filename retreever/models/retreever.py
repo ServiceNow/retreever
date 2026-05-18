@@ -1,13 +1,14 @@
+import math
 import torch
 
 from omegaconf import OmegaConf
 from typing import Callable, Optional
 
-from retreever import config
-from retreever.models.encoders import get_encoders
+from retreever.models.encoders import get_encoders, merge_lora_weights
 from retreever.models.trees import tree_dict
+from retreever.utils.toolkit_paths import PATH_HF_CACHE_RW
+
 from retreever.models.indexing_strategies import index_strategy_dict
-from retreever.models.adapters import get_adapter
 import torch.nn.functional as F
 
 
@@ -15,13 +16,63 @@ def freeze_module(module):
     for param in module.parameters():
         param.requires_grad = False
 
-def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwargs):
+
+def auto_detect_lora_target_modules(model):
+    """Auto-detect attention layer names for LoRA targeting.
+    
+    Returns only query and value projections (standard LoRA practice).
+    
+    Args:
+        model: The model to inspect
+        
+    Returns:
+        list: Target module names (query and value only)
+    """
+    # Get all module names from the model
+    module_names = set()
+    for name, _ in model.named_modules():
+        leaf_name = name.split('.')[-1]
+        module_names.add(leaf_name)
+    
+    # Standard LoRA patterns: Query + Value only
+    qv_patterns = [
+        ('query', 'value'),          # BERT/RoBERTa/BGE
+        ('q_proj', 'v_proj'),        # LLaMA/Mistral/CLIP
+        ('q', 'v'),                  # T5
+        ('q_lin', 'v_lin'),          # DistilBERT
+    ]
+    
+    # Try each pattern and return the first match
+    for pattern in qv_patterns:
+        if all(name in module_names for name in pattern):
+            return list(pattern)
+    
+    # Fallback: find q and v attention layers
+    fallback_targets = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            leaf_name = name.split('.')[-1]
+            # Only include query and value variants
+            if any(qv in leaf_name.lower() for qv in ['query', 'value', 'q_lin', 'v_lin', 'q_proj', 'v_proj']):
+                if leaf_name not in fallback_targets:
+                    fallback_targets.append(leaf_name)
+    
+    if fallback_targets:
+        print(f"Warning: Using fallback LoRA targets: {fallback_targets}")
+        return fallback_targets
+    
+    raise ValueError(
+        f"Could not auto-detect LoRA target modules. Found modules: {sorted(module_names)}\n"
+        "Please manually specify lora_target_modules=['module_name1', 'module_name2']"
+    )
+
+def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = PATH_HF_CACHE_RW, **kwargs):
     """Loads a Retreever model given a checkpoint and a configuration.
 
     Args:
         ckpt_path (str): path to .bin checkpoint
         cfg_path (str): path to .yaml configuration file
-        cache_dir (str, optional): path to cache directory. Defaults to None (uses HuggingFace default cache).
+        cache_dir (str, optional): path to cache directory. Defaults to PATH_HF_CACHE_RW.
         **kwargs: Additional keyword arguments.
             - force_topk_strategy (bool): If provided and True, this is used to overwrite the model's
             existing evaluation strategy with the `topk_strategy` provided here (or 'greedy' as default)
@@ -32,15 +83,13 @@ def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwarg
     """
 
     # load checkpoint
-    checkpoint = torch.load(ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
     checkpoint.pop(
         "loss.temp_param.temp_coef", None
     )  # as Loss is not instantiated, keeping this parameter would throw an error
 
-    checkpoint.pop(
-        "loss.criterion.temp_param.temp_coef", None
-    )  # Needed when trained with MRL loss.
+    checkpoint.pop("loss.criterion.temp_param.temp_coef", None)
 
     checkpoint.pop("loss.corr_scale", None)
 
@@ -85,7 +134,6 @@ def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwarg
         eval_depth = cfg.model.tree_depth
 
     # instantiate model
-    cache_dir = cache_dir or config.HF_CACHE_DIR
     model = ReTreever(
         loss=None,
         encoder_type=cfg.model.encoder_type,
@@ -123,17 +171,339 @@ def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, **kwarg
         encoder_finetune_strategy=cfg.model.get("encoder_finetune_strategy", "none"),
         finetuned_encoder_checkpoint=cfg.model.get("finetuned_encoder_checkpoint", None),
         freeze_finetuned_components=cfg.model.get("freeze_finetuned_components", True),
+        num_cross_attn_queries=cfg.model.get("num_cross_attn_queries", 10),
+        # Tree adapter (for cross-dataset transfer)
+        tree_adapter_targets=cfg.model.get("tree_adapter_targets", []),
+        tree_adapter_lora_r=cfg.model.get("tree_adapter_lora_r", 8),
+        tree_adapter_lora_alpha=cfg.model.get("tree_adapter_lora_alpha", 16),
+        tree_adapter_logit_type=cfg.model.get("tree_adapter_logit_type", "scalar"),
     )
-    model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint, strict=False)
 
     return model, cfg
 
+class LinearAdapter(torch.nn.Module):
+    """Linear projection with residual connection."""
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.projection = torch.nn.Linear(input_dim, output_dim)
+        
+    def forward(self, x):
+        return x + self.projection(x)  # Residual connection
+    
+class LinearAdapterZeroInit(torch.nn.Module):
+    """Linear projection with residual connection."""
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.projection = torch.nn.Linear(input_dim, output_dim)
+        
+        # --- FIX: Zero Initialization ---
+        # This ensures the adapter starts as an identity function (output = x + 0)
+        torch.nn.init.zeros_(self.projection.weight)
+        torch.nn.init.zeros_(self.projection.bias)
+        
+    def forward(self, x):
+        return x + self.projection(x)
 
-# Note: Adapter classes have been moved to retreever/models/adapters.py
-# Only 3 finetune strategies are now supported:
-# - shared_mlp_zero_init_norm
-# - shared_linear_zero_init_norm  
-# - mrl
+
+class MLPAdapter(torch.nn.Module):
+    """MLP adapter with 4x expansion and residual connection."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return residual + x  # Residual connection
+    
+class MLPAdapterWithZeroInit(torch.nn.Module):
+    """MLP adapter with 4x expansion and residual connection."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+
+        # --- FIX: Zero Initialization for the LAST layer only ---
+        torch.nn.init.zeros_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return residual + x
+    
+class MLPAdapterWithZeroInitNorm(torch.nn.Module):
+    """MLP adapter with 4x expansion and residual connection."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+
+        # --- FIX: Zero Initialization for the LAST layer only ---
+        torch.nn.init.zeros_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+        
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return F.normalize(residual + x, p=2, dim=-1)
+    
+class LinearAdapterWithZeroInitNorm(torch.nn.Module):
+    """MLP adapter with 4x expansion and residual connection."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.projection = torch.nn.Linear(input_dim, output_dim)
+        
+        # This ensures the adapter starts as an identity function (output = x + 0)
+        torch.nn.init.zeros_(self.projection.weight)
+        torch.nn.init.zeros_(self.projection.bias)
+        
+    def forward(self, x):
+        return F.normalize(x + self.projection(x), p=2, dim=-1)
+
+
+class MLPAdapterWithZeroInitSoftmax(torch.nn.Module):
+    """MLP adapter with 4x expansion, residual connection, and softmax output (probability distribution)."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+
+        torch.nn.init.zeros_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return F.softmax(residual + x, dim=-1)
+
+
+class LinearAdapterWithZeroInitSoftmax(torch.nn.Module):
+    """Linear adapter with residual connection and softmax output (probability distribution)."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.projection = torch.nn.Linear(input_dim, output_dim)
+
+        torch.nn.init.zeros_(self.projection.weight)
+        torch.nn.init.zeros_(self.projection.bias)
+
+    def forward(self, x):
+        return F.softmax(x + self.projection(x), dim=-1)
+
+
+class MLPAdapterWithoutResidual(torch.nn.Module):
+    """MLP adapter with 4x expansion and residual connection."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return  x  # Residual connection
+
+
+class BottleneckAdapter(torch.nn.Module):
+    """Houlsby-style bottleneck adapter with residual."""
+    def __init__(self, input_dim: int, bottleneck_dim: int = 64):
+        super().__init__()
+        self.down_project = torch.nn.Linear(input_dim, bottleneck_dim)
+        self.activation = torch.nn.ReLU()
+        self.up_project = torch.nn.Linear(bottleneck_dim, input_dim)
+        
+    def forward(self, x):
+        residual = x
+        x = self.down_project(x)
+        x = self.activation(x)
+        x = self.up_project(x)
+        return residual + x  # Residual connection (Houlsby-style)
+    
+class OptimizedBottleneckAdapter(torch.nn.Module):
+    """Low-rank bottleneck with zero init."""
+    def __init__(self, input_dim: int, reduction_factor: int = 8):
+        super().__init__()
+        bottleneck_dim = input_dim // reduction_factor
+        
+        self.down_project = torch.nn.Linear(input_dim, bottleneck_dim)
+        self.activation = torch.nn.GELU()
+        self.up_project = torch.nn.Linear(bottleneck_dim, input_dim)
+        
+        # Init Strategy:
+        # 1. Kaiming/Xavier for the down projection (to preserve variance)
+        torch.nn.init.kaiming_normal_(self.down_project.weight)
+        
+        # 2. ZERO init for the up projection (to start as identity)
+        torch.nn.init.zeros_(self.up_project.weight)
+        torch.nn.init.zeros_(self.up_project.bias)
+        
+    def forward(self, x):
+        residual = x
+        x = self.down_project(x)
+        x = self.activation(x)
+        x = self.up_project(x)
+        return residual + x
+
+class PreNormAdapter(torch.nn.Module):
+    """Applies LayerNorm before the adapter, keeping residual clean."""
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(input_dim)
+        
+        hidden_dim = input_dim * 4
+        self.fc1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.activation = torch.nn.GELU()
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
+        
+        # Zero Init the last layer
+        torch.nn.init.zeros_(self.fc2.weight)
+        torch.nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        residual = x
+        
+        # Norm only affects the adapter branch
+        out = self.norm(x)
+        out = self.fc1(out)
+        out = self.activation(out)
+        out = self.fc2(out)
+        
+        return residual + out
+
+class QFormerPoolingAdapter(torch.nn.Module):
+    """QFormer-style cross-attention pooling adapter.
+
+    Learns `num_queries` query vectors of dimension `d_model` that cross-attend
+    to the frozen encoder token outputs (K/V) via explicit multi-head attention
+    (same manual einsum style as CrossAttentionSplit).
+
+    Architecture:
+        learned_queries [Q, d]  ->  query_proj  [Q, n_heads, head_dim]
+        tokens [B, seq, d]      ->  key_proj    [B, seq, n_heads, head_dim]
+        tokens [B, seq, d]      ->  value_proj  [B, seq, n_heads, head_dim]
+
+        attn_scores  [B, n_heads, Q, seq]  (einsum + scale + mask + softmax)
+        agg_values   [B, Q, d]             (einsum + reshape)
+        norm         [B, Q, d]
+        mean over Q  [B, d]
+
+    Shared between query and context encoders.
+    """
+
+    def __init__(self, d_model: int, num_queries: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+
+        self.num_queries = num_queries
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = math.sqrt(self.head_dim)
+
+        # Learned query vectors (initialised with small normal noise)
+        self.learned_queries = torch.nn.Parameter(torch.empty(num_queries, d_model))
+        torch.nn.init.normal_(self.learned_queries, std=0.02)
+
+        # Q/K/V projections (same as CrossAttentionSplit)
+        self.query_proj = torch.nn.Linear(d_model, d_model)
+        self.key_proj   = torch.nn.Linear(d_model, d_model)
+        self.value_proj = torch.nn.Linear(d_model, d_model)
+
+        self.attn_dropout = torch.nn.Dropout(p=dropout)
+
+        # Post-attention layer norm
+        self.norm = torch.nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x:    [B, seq, d]  - token-level encoder output
+            mask: [B, seq]     - 1 for real tokens, 0 for padding
+        Returns:
+            [B, d]
+        """
+        B, seq, _ = x.shape
+        Q  = self.num_queries
+        h  = self.n_heads
+        hd = self.head_dim
+
+        # Project learned queries: [Q, d] -> [Q, h, hd]
+        queries = self.query_proj(self.learned_queries).view(Q, h, hd)
+
+        # Project token K/V: [B, seq, d] -> [B, seq, h, hd]
+        keys   = self.key_proj(x).view(B, seq, h, hd)
+        values = self.value_proj(x).view(B, seq, h, hd)
+
+        # Attention scores: [B, h, Q, seq]
+        attn_scores = torch.einsum("bnhd,qhd->bhqn", keys, queries) / self.scale
+
+        # Mask padding tokens
+        if mask is not None:
+            # mask: [B, seq] -> [B, 1, 1, seq]
+            attn_scores = attn_scores.masked_fill(mask[:, None, None, :] == 0, float("-inf"))
+
+        # Softmax + dropout over sequence dim
+        attn_weights = F.softmax(attn_scores, dim=-1)   # [B, h, Q, seq]
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Aggregate values: [B, h, Q, hd]
+        agg = torch.einsum("bnhd,bhqn->bhqd", values, attn_weights)
+
+        # Merge heads: [B, Q, d]
+        agg = agg.permute(0, 2, 1, 3).reshape(B, Q, self.d_model)
+
+        # LayerNorm
+        agg = self.norm(agg)
+
+        # Mean over Q queries: [B, Q, d] -> [B, d]
+        out = agg.mean(dim=1)
+
+        return out
+
+
+class QFormerPoolingAdapterSoftmax(QFormerPoolingAdapter):
+    """QFormer-style cross-attention pooling with softmax output (probability distribution).
+
+    Identical to QFormerPoolingAdapter but applies softmax over the embedding
+    dimension so the output is a valid probability distribution.  Designed to
+    be used with TVD (Total Variation Distance) as the similarity measure.
+    """
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        out = super().forward(x, mask=mask)       # [B, d]
+        return F.softmax(out, dim=-1)
+
 
 class ReTreever(torch.nn.Module):
     def __init__(
@@ -145,7 +515,7 @@ class ReTreever(torch.nn.Module):
         cache_dir: str = None,
         dual_model: bool = False,
         freeze_encoder: bool = True,
-        encoder_finetune_strategy: str = "none",  # Options: "shared_mlp_zero_init_norm", "shared_linear_zero_init_norm", "mrl"
+        encoder_finetune_strategy: str = "none",  # ADD: "none", "last_layer", "lora", "linear", "mlp", "adapter", "bitfit", "layernorm"
         emb_size: int = None,
         eval_strategy: str = "greedy",
         train_full_tree_rep: bool = False,
@@ -180,6 +550,13 @@ class ReTreever(torch.nn.Module):
                 "use_simvq": module_params.pop("use_simvq", False),
                 "dropout_location": module_params.pop("dropout_location", "inside_split"),
             }
+        # QFormer n_heads: reuse cross_attn's n_heads when applicable so the
+        # user's split_fn_n_heads override actually reaches the split function.
+        # For other split functions, pop n_heads independently.
+        if "n_heads" in tree_split_fn_params:
+            qformer_n_heads = tree_split_fn_params["n_heads"]
+        else:
+            qformer_n_heads = module_params.pop("n_heads", 8)
         if tree_split_fn == "llm_split":
              tree_split_fn_params = {
                  "use_sigmoid_in_projection": module_params.pop("use_sigmoid_in_projection", False),
@@ -190,6 +567,12 @@ class ReTreever(torch.nn.Module):
         # Adapter/finetuning hyperparameters
         adapter_bottleneck_dim = module_params.pop("adapter_bottleneck_dim", 64)
         mlp_dropout = module_params.pop("mlp_dropout", 0.1)
+        lora_r = module_params.pop("lora_r", 8)
+        lora_alpha = module_params.pop("lora_alpha", 16)
+        lora_dropout = module_params.pop("lora_dropout", 0.1)
+        lora_target_modules = module_params.pop("lora_target_modules", None)
+        # QFormer pooling hyperparameters
+        num_cross_attn_queries = module_params.pop("num_cross_attn_queries", 10)
 
         # get encoder parameters
         self.token_level_enc = module_params.pop("encoder_token_level", False)
@@ -201,7 +584,6 @@ class ReTreever(torch.nn.Module):
             raise ValueError(f"Token level encoding is not supported for {tree_split_fn} splits")
 
         # instantiate separate context encoder and tree
-        cache_dir = cache_dir or config.HF_CACHE_DIR
         self.query_encoder, self.context_encoder = get_encoders(
             self.encoder_type,
             cache_dir=cache_dir,
@@ -213,6 +595,11 @@ class ReTreever(torch.nn.Module):
         # lockin flags
         self.lock_in_query_encoder = module_params.pop("lock_in_query_encoder", False)
         self.lock_in_context_encoder = module_params.pop("lock_in_context_encoder", False)
+        
+        finetuned_encoder_path = module_params.pop("finetuned_encoder_path", None)
+        if finetuned_encoder_path is not None:
+            self.query_encoder, self.context_encoder = merge_lora_weights(finetuned_encoder_path, self.query_encoder, self.context_encoder)
+            print("Loaded finetuned encoders")
 
         if emb_size is None:
             emb_size = self.context_encoder.output_size
@@ -290,31 +677,306 @@ class ReTreever(torch.nn.Module):
                 # No finetuning strategy specified - raise error
                 raise ValueError(
                     "freeze_encoder=False but no encoder_finetune_strategy specified. "
-                    "Choose from: 'shared_mlp_zero_init_norm', 'shared_linear_zero_init_norm', 'mrl'"
+                    "Choose from: 'last_layer', 'lora', 'linear', 'mlp', 'adapter', 'bitfit', 'layernorm'"
                 )
             
-            elif encoder_finetune_strategy in ["shared_mlp_zero_init_norm", "shared_linear_zero_init_norm", "mrl"]:
-                # Freeze encoders and add shared adapter using get_adapter factory
+            elif encoder_finetune_strategy == "last_layer":
+                # Freeze entire encoder first
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                    
+                for encoder in encoders_to_finetune:
+                    # Check if this is ResNet
+                    if hasattr(encoder, '__class__') and 'ResNet' in encoder.__class__.__name__:
+                        # For ResNet: unfreeze the last sequential block
+                        # ResNet is wrapped as nn.Sequential, so access the last child
+                        last_layer = list(encoder.model.children())[-1]
+                        for param in last_layer.parameters():
+                            param.requires_grad = True
+                        print(f"Unfroze last layer for ResNet encoder")
+                        continue
+                    
+                    # Try common transformer layer paths
+                    layers = None
+                    
+                    # BERT/RoBERTa/BGE/Contriever/SimCSE: model.encoder.layer
+                    if hasattr(encoder.model, 'encoder') and hasattr(encoder.model.encoder, 'layer'):
+                        layers = encoder.model.encoder.layer
+                    # DistilBERT: model.transformer.layer
+                    elif hasattr(encoder.model, 'transformer') and hasattr(encoder.model.transformer, 'layer'):
+                        layers = encoder.model.transformer.layer
+                    # Direct access: model.layer (some custom wrappers)
+                    elif hasattr(encoder.model, 'layer'):
+                        layers = encoder.model.layer
+                    
+                    if layers is not None:
+                        # Unfreeze last layer
+                        for param in layers[-1].parameters():
+                            param.requires_grad = True
+                        print(f"Unfroze last layer for {encoder.__class__.__name__}")
+                    else:
+                        raise ValueError(
+                            f"Could not find transformer layers in {encoder.__class__.__name__}. "
+                            f"Model structure: {type(encoder.model)}"
+                        )
+                                
+            elif encoder_finetune_strategy == "lora":
+                try:
+                    from peft import LoraConfig, get_peft_model
+                except ImportError:
+                    raise ImportError("Please install peft: pip install peft")
+                
+                # Freeze encoders
                 freeze_module(self.query_encoder)
                 freeze_module(self.context_encoder)
                 
-                # Use factory function from adapters.py
-                adapter = get_adapter(
-                    strategy=encoder_finetune_strategy,
-                    input_dim=emb_size,
-                    output_dim=emb_size,
-                    dropout=mlp_dropout
+                # Auto-detect target modules if not specified
+                if lora_target_modules is None:
+                    # Auto-detect from context encoder (query encoder should have same structure)
+                    detected_targets = auto_detect_lora_target_modules(self.context_encoder.model)
+                    print(f"Auto-detected LoRA target modules: {detected_targets}")
+                    lora_target_modules = detected_targets
+                
+                # Apply LoRA
+                lora_config = LoraConfig(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    target_modules=lora_target_modules,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    # task_type="FEATURE_EXTRACTION"
                 )
                 
-                # Share the adapter between query and context
+                if self.context_encoder in encoders_to_finetune:
+                    self.context_encoder.model = get_peft_model(self.context_encoder.model, lora_config)
+                if self.query_encoder in encoders_to_finetune:
+                    self.query_encoder.model = get_peft_model(self.query_encoder.model, lora_config)
+                    
+            elif encoder_finetune_strategy == "lora_common":
+                try:
+                    from peft import LoraConfig, get_peft_model
+                except ImportError:
+                    raise ImportError("Please install peft: pip install peft")
+                
+                # Freeze encoders
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                # Auto-detect target modules if not specified
+                if lora_target_modules is None:
+                    detected_targets = auto_detect_lora_target_modules(self.context_encoder.model)
+                    print(f"Auto-detected LoRA target modules: {detected_targets}")
+                    lora_target_modules = detected_targets
+                
+                # Apply LoRA configuration
+                lora_config = LoraConfig(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    target_modules=lora_target_modules,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                )
+                
+                # Apply LoRA to context encoder first
+                if self.context_encoder in encoders_to_finetune:
+                    self.context_encoder.model = get_peft_model(self.context_encoder.model, lora_config)
+                
+                # Share the same LoRA-adapted model with query encoder
+                if self.query_encoder in encoders_to_finetune:
+                    self.query_encoder.model = self.context_encoder.model
+                
+                print("Applied shared LoRA weights between query and context encoders")
+
+            elif encoder_finetune_strategy == "linear":
+                # Freeze encoders, add linear adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = LinearAdapter(emb_size, emb_size)
+                self.context_projection = LinearAdapter(emb_size, emb_size)
+
+            elif encoder_finetune_strategy == "linear_zero_init":
+                # Freeze encoders, add linear adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = LinearAdapterZeroInit(emb_size, emb_size)
+                self.context_projection = LinearAdapterZeroInit(emb_size, emb_size)
+                
+            elif encoder_finetune_strategy == "mlp":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = MLPAdapter(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = MLPAdapter(emb_size, emb_size, dropout=mlp_dropout)
+                
+            elif encoder_finetune_strategy == "mlp_no_residual":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = MLPAdapterWithoutResidual(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = MLPAdapterWithoutResidual(emb_size, emb_size, dropout=mlp_dropout)
+                
+            elif encoder_finetune_strategy == "mlp_zero_init":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
+                
+            elif encoder_finetune_strategy == "shared_mlp_zero_init":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                adapter = MLPAdapterWithZeroInit(emb_size, emb_size, dropout=mlp_dropout)
+                
+                self.query_projection = adapter
+                self.context_projection = adapter    
+                            
+            elif encoder_finetune_strategy == "shared_mlp_zero_init_norm":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                adapter = MLPAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+                
                 self.query_projection = adapter
                 self.context_projection = adapter
+                
+            elif encoder_finetune_strategy == "shared_linear_zero_init_norm":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                adapter = LinearAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+                
+                self.query_projection = adapter
+                self.context_projection = adapter
+
+            elif encoder_finetune_strategy == "linear_zero_init_norm":
+                # Dual (non-shared) linear adapters with L2 norm
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                self.query_projection = LinearAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = LinearAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+
+            elif encoder_finetune_strategy == "mlp_zero_init_norm":
+                # Dual (non-shared) MLP adapters with L2 norm
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                self.query_projection = MLPAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = MLPAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
+
+            elif encoder_finetune_strategy == "shared_linear_zero_init_softmax":
+                # Shared linear adapter with softmax output (probability distribution)
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                adapter = LinearAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
+                self.query_projection = adapter
+                self.context_projection = adapter
+
+            elif encoder_finetune_strategy == "shared_mlp_zero_init_softmax":
+                # Shared MLP adapter with softmax output (probability distribution)
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                adapter = MLPAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
+                self.query_projection = adapter
+                self.context_projection = adapter
+
+            elif encoder_finetune_strategy == "pre_norm_mlp":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = PreNormAdapter(emb_size, emb_size, dropout=mlp_dropout)
+                self.context_projection = PreNormAdapter(emb_size, emb_size, dropout=mlp_dropout)
+                
+            elif encoder_finetune_strategy == "shared_qformer_pooling":
+                # Freeze encoders; apply shared QFormer-style cross-attn pooling adapter.
+                # Q learned queries attend to frozen token K/V -> [batch, Q, d] -> linear -> [batch, d].
+                # Designed to be paired with identity_tree (the d-dim output is the final representation).
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                if not self.token_level_enc:
+                    raise ValueError(
+                        "shared_qformer_pooling requires token-level encoder output. "
+                        "Set encoder_token_level=True in config."
+                    )
+                adapter = QFormerPoolingAdapter(
+                    d_model=emb_size,
+                    num_queries=num_cross_attn_queries,
+                    n_heads=qformer_n_heads,
+                    dropout=mlp_dropout,
+                )
+                self.query_projection = adapter
+                self.context_projection = adapter
+                print(
+                    f"shared_qformer_pooling: Q={num_cross_attn_queries}, "
+                    f"n_heads={qformer_n_heads}, d_model={emb_size}"
+                )
+
+            elif encoder_finetune_strategy == "shared_qformer_pooling_softmax":
+                # Same as shared_qformer_pooling but with softmax output (probability distribution).
+                # Designed for use with sim_measure=tvd.
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                if not self.token_level_enc:
+                    raise ValueError(
+                        "shared_qformer_pooling_softmax requires token-level encoder output. "
+                        "Set encoder_token_level=True in config."
+                    )
+                adapter = QFormerPoolingAdapterSoftmax(
+                    d_model=emb_size,
+                    num_queries=num_cross_attn_queries,
+                    n_heads=qformer_n_heads,
+                    dropout=mlp_dropout,
+                )
+                self.query_projection = adapter
+                self.context_projection = adapter
+                print(
+                    f"shared_qformer_pooling_softmax: Q={num_cross_attn_queries}, "
+                    f"n_heads={qformer_n_heads}, d_model={emb_size}"
+                )
+
+            elif encoder_finetune_strategy == "bottleneck":
+                # Freeze encoders, add MLP adapter on top
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = OptimizedBottleneckAdapter(emb_size)
+                self.context_projection = OptimizedBottleneckAdapter(emb_size)
+                
+            elif encoder_finetune_strategy == "adapter":
+                # Freeze encoders, add Houlsby-style bottleneck adapter
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                self.query_projection = BottleneckAdapter(emb_size, bottleneck_dim=adapter_bottleneck_dim)
+                self.context_projection = BottleneckAdapter(emb_size, bottleneck_dim=adapter_bottleneck_dim)
+                
+            elif encoder_finetune_strategy == "bitfit":
+                # Freeze all except bias parameters
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                for encoder in encoders_to_finetune:
+                    for name, param in encoder.named_parameters():
+                        if 'bias' in name:
+                            param.requires_grad = True
+                            
+            elif encoder_finetune_strategy == "layernorm":
+                # Freeze all except LayerNorm parameters
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                
+                for encoder in encoders_to_finetune:
+                    for name, param in encoder.named_parameters():
+                        if 'LayerNorm' in name or 'layer_norm' in name:
+                            param.requires_grad = True
                             
             else:
-                raise ValueError(
-                    f"Unknown encoder_finetune_strategy: {encoder_finetune_strategy}. "
-                    f"Supported strategies: 'shared_mlp_zero_init_norm', 'shared_linear_zero_init_norm', 'mrl'"
-                )
+                raise ValueError(f"Unknown encoder_finetune_strategy: {encoder_finetune_strategy}")
             
         # Load from checkpoint if provided (must happen after LoRA is applied)
         if self._pending_checkpoint_load is not None:
@@ -345,6 +1007,43 @@ class ReTreever(torch.nn.Module):
         # if self.context_projection is not None:
         #     self.context_projection = self.context_projection.to(torch.float32)
                             
+        # ── Tree adapter (for cross-dataset transfer) ─────────────
+        tree_adapter_targets = module_params.pop("tree_adapter_targets", [])
+        if isinstance(tree_adapter_targets, str):
+            # Handle hydra passing a string like "embeddings,logits"
+            tree_adapter_targets = [t.strip() for t in tree_adapter_targets.split(",") if t.strip()]
+        if tree_adapter_targets:
+            from retreever.models.split_functions import TreeAdapter
+            tree_adapter_lora_r = module_params.pop("tree_adapter_lora_r", 8)
+            tree_adapter_lora_alpha = module_params.pop("tree_adapter_lora_alpha", 16)
+            tree_adapter_logit_type = module_params.pop("tree_adapter_logit_type", "scalar")
+
+            # Freeze entire tree first
+            freeze_module(self.context_tree)
+            if self.dual_model:
+                freeze_module(self.query_tree)
+
+            # Create and attach adapter (its params are unfrozen by construction)
+            adapter = TreeAdapter(
+                split_fn=self.context_tree.split,
+                adapt_embeddings="embeddings" in tree_adapter_targets,
+                adapt_projections="projections" in tree_adapter_targets,
+                adapt_scoring="scoring" in tree_adapter_targets,
+                adapt_logits="logits" in tree_adapter_targets,
+                lora_r=tree_adapter_lora_r,
+                lora_alpha=tree_adapter_lora_alpha,
+                logit_adapter_type=tree_adapter_logit_type,
+            )
+            self.context_tree.split.adapter = adapter
+            if self.dual_model:
+                self.query_tree.split.adapter = adapter
+
+            # Print tree param counts
+            tree_total = sum(p.numel() for p in self.context_tree.parameters())
+            tree_trainable = sum(p.numel() for p in self.context_tree.parameters() if p.requires_grad)
+            print(f"Tree: {tree_trainable:,} / {tree_total:,} trainable parameters "
+                  f"(adapter targets: {tree_adapter_targets})")
+
         # Print trainable parameter counts
         for encoder_name, encoder in [('Query', self.query_encoder), ('Context', self.context_encoder)]:
             total_params = sum(p.numel() for p in encoder.parameters())
@@ -364,15 +1063,25 @@ class ReTreever(torch.nn.Module):
         # structure to index contexts. init to empty
         self.reset_index()
         
-    def _apply_projection(self, embeddings, projection_layer):
-        """Apply projection/adapter layer if it exists."""
+    def _apply_projection(self, embeddings, projection_layer, mask=None):
+        """Apply projection/adapter layer if it exists.
+
+        Args:
+            embeddings:       [batch, hidden] or [batch, seq, hidden]
+            projection_layer: adapter module (or None)
+            mask:             [batch, seq] attention mask; only used by QFormerPoolingAdapter
+        """
         if projection_layer is not None:
-            # Handle both [batch, hidden] and [batch, seq, hidden] shapes
             if next(projection_layer.parameters()).dtype != embeddings.dtype:
                 projection_layer = projection_layer.to(embeddings.dtype)
+
+            # QFormer path: takes full token sequence + mask -> [batch, d]
+            if isinstance(projection_layer, QFormerPoolingAdapter):
+                return projection_layer(embeddings, mask)
+
             original_shape = embeddings.shape
             if len(original_shape) == 3:
-                # Token-level: [batch, seq, hidden]
+                # Token-level: [batch, seq, hidden] - apply adapter per token
                 batch, seq, hidden = original_shape
                 embeddings = embeddings.reshape(-1, hidden)
                 embeddings = projection_layer(embeddings)
@@ -387,7 +1096,7 @@ class ReTreever(torch.nn.Module):
         """Load encoder finetuning from checkpoint. Supports only LoRA and last_layer."""
         
         print(f"Loading finetuned encoder from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
         
         # Detect finetuning strategy from checkpoint keys
         has_lora = any('lora' in key.lower() for key in checkpoint.keys())
@@ -484,7 +1193,7 @@ class ReTreever(torch.nn.Module):
 
     def load_and_freeze_shared_mlp(self, checkpoint_path: str):
         """Load shared MLP projection from checkpoint and freeze it."""
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
         
         # Handle both checkpoint dict and direct state dict
         if 'model_state_dict' in checkpoint:
@@ -526,7 +1235,7 @@ class ReTreever(torch.nn.Module):
                 attention_mask=tokens["attention_mask"],
                 output_attentions=False,
             )
-            embeddings = self._apply_projection(embeddings, self.query_projection)
+            embeddings = self._apply_projection(embeddings, self.query_projection, tokens["attention_mask"])
             assignments = self.query_tree(embeddings, tokens["attention_mask"], rep_level)
 
         elif tag == "passage":
@@ -542,7 +1251,7 @@ class ReTreever(torch.nn.Module):
                 attention_mask=tokens["attention_mask"],
                 output_attentions=False,
             )
-            embeddings = self._apply_projection(embeddings, self.context_projection)
+            embeddings = self._apply_projection(embeddings, self.context_projection, tokens["attention_mask"])
             assignments = self.context_tree(embeddings, tokens["attention_mask"], rep_level)
 
         return assignments
@@ -580,7 +1289,7 @@ class ReTreever(torch.nn.Module):
             attention_mask=question_attn_mask,
             output_attentions=enc_output_attentions,
         )
-        
+
         if question_attn_mask is None:
             # Image mode: create all-ones mask matching embedding shape
             batch_size = q_embeddings.shape[0]
@@ -588,7 +1297,7 @@ class ReTreever(torch.nn.Module):
             question_attn_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=q_embeddings.device)
             
     
-        q_embeddings = self._apply_projection(q_embeddings, self.query_projection)
+        q_embeddings = self._apply_projection(q_embeddings, self.query_projection, question_attn_mask)
         q_assignments = self.query_tree(q_embeddings, question_attn_mask, -1)
         
         # extra_q_losses = getattr(self.query_tree.split, 'extra_loss', torch.tensor(0.0, device=question_ids.device))
@@ -597,6 +1306,8 @@ class ReTreever(torch.nn.Module):
             context_ids,
             attention_mask=context_attn_mask,
             output_attentions=enc_output_attentions,
+            # modality=kwargs.get("modality", None),
+            # is_longer=kwargs.get("is_longer", None),
         )
         if context_attn_mask is None:
             # Image mode: create all-ones mask matching embedding shape
@@ -604,7 +1315,7 @@ class ReTreever(torch.nn.Module):
             seq_len = c_embeddings.shape[1] if len(c_embeddings.shape) == 3 else 1
             context_attn_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=c_embeddings.device)
             
-        c_embeddings = self._apply_projection(c_embeddings, self.context_projection)
+        c_embeddings = self._apply_projection(c_embeddings, self.context_projection, context_attn_mask)
         c_assignments = self.context_tree(c_embeddings, context_attn_mask, -1)
         
         # extra_c_losses = getattr(self.context_tree.split, 'extra_loss', torch.tensor(0.0, device=question_ids.device))
@@ -658,7 +1369,7 @@ class ReTreever(torch.nn.Module):
                 context_ids,
                 attention_mask=context_attn_mask,
             )
-            c_embeddings = self._apply_projection(c_embeddings, self.context_projection)
+            c_embeddings = self._apply_projection(c_embeddings, self.context_projection, context_attn_mask)
             c_assignments = self.context_tree(
                 c_embeddings,
                 context_attn_mask,
@@ -667,8 +1378,9 @@ class ReTreever(torch.nn.Module):
 
             self.lowest_score = min(self.lowest_score, torch.min(c_assignments))
             self.highest_score = max(self.highest_score, torch.max(c_assignments))
-
-        to_embed = F.normalize(c_embeddings[:, 0, :], dim=-1) if index_embeddings else c_assignments
+            
+        # note this is potentially problematic for index_embeddings case if taking the 0th token isnt the right move
+        to_embed = F.normalize(c_embeddings[:, 0, :], dim=-1) if index_embeddings else c_assignments 
         self.indexing_strategy.index_ctxs(to_embed, context_names, threshold=threshold)
 
     def top_contexts(
@@ -701,7 +1413,7 @@ class ReTreever(torch.nn.Module):
                 question_ids,
                 attention_mask=question_attn_mask,
             )
-            q_embeddings = self._apply_projection(q_embeddings, self.query_projection)
+            q_embeddings = self._apply_projection(q_embeddings, self.query_projection, question_attn_mask)
             q_assignments = self.query_tree(
                 q_embeddings, question_attn_mask, depth=self.eval_depth
             ).detach()
@@ -726,19 +1438,34 @@ class ReTreever(torch.nn.Module):
         depth=0,
         **kwargs,
     ):
-        c_embeddings = self.context_encoder(
-            context_ids,
-            attention_mask=context_attn_mask,
-            output_attentions=enc_output_attentions,
-        )
-        c_embeddings = self._apply_projection(c_embeddings, self.context_projection)
+        # Use eval mode to avoid BatchNorm issues when a subset (e.g. is_longer)
+        # has only 1 sample.  No gradients needed for tree init.
+        ctx_was_training = self.context_encoder.training
+        qry_was_training = self.query_encoder.training
+        self.context_encoder.eval()
+        self.query_encoder.eval()
 
-        q_embeddings = self.query_encoder(
-            question_ids,
-            attention_mask=question_attn_mask,
-            output_attentions=enc_output_attentions,
-        )
-        q_embeddings = self._apply_projection(q_embeddings, self.query_projection)
+        with torch.no_grad():
+            c_embeddings = self.context_encoder(
+                context_ids,
+                attention_mask=context_attn_mask,
+                output_attentions=enc_output_attentions,
+                # modality=kwargs.get("modality", None),
+                # is_longer=kwargs.get("is_longer", None),
+            )
+            c_embeddings = self._apply_projection(c_embeddings, self.context_projection, context_attn_mask)
+
+            q_embeddings = self.query_encoder(
+                question_ids,
+                attention_mask=question_attn_mask,
+                output_attentions=enc_output_attentions,
+            )
+            q_embeddings = self._apply_projection(q_embeddings, self.query_projection, question_attn_mask)
+
+        if ctx_was_training:
+            self.context_encoder.train()
+        if qry_was_training:
+            self.query_encoder.train()
 
         if self.dual_model:
             self.query_tree._init_split_fn(q_embeddings, depth)

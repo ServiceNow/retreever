@@ -2,7 +2,6 @@ import math
 import random
 
 
-# TODO: implement checkpointing for depth schedulers
 class LinearDepthScheduler:
     def __init__(self, max_steps: int = 1000, min_value: int = 4, max_value: int = 11):
         """Gradually increase depth at which computing the loss during training warmup.
@@ -24,6 +23,12 @@ class LinearDepthScheduler:
             self.depth += 1
 
         return self.depth
+
+    def state_dict(self):
+        return {"depth": self.depth}
+
+    def load_state_dict(self, state):
+        self.depth = state["depth"]
 
 
 class ExponentialDepthScheduler:
@@ -67,6 +72,15 @@ class ExponentialDepthScheduler:
 
         return self.depth
 
+    def state_dict(self):
+        return {"depth": self.depth, "current_step_interval": self.current_step_interval,
+                "last_change": self.last_change}
+
+    def load_state_dict(self, state):
+        self.depth = state["depth"]
+        self.current_step_interval = state["current_step_interval"]
+        self.last_change = state["last_change"]
+
 
 class RandomDepthScheduler:
     def __init__(self, min_value: int = 1, max_value: int = 10, *args, **kwargs):
@@ -87,6 +101,13 @@ class RandomDepthScheduler:
         return self.depth
     
 
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        pass
+
+
 class RandomHeavyTailedDepthScheduler:
     def __init__(self, min_value: int = 1, max_value: int = 10, *args, **kwargs):
         """Randomly choose depth at which computing the loss during training.
@@ -105,6 +126,13 @@ class RandomHeavyTailedDepthScheduler:
         )[0]
         return self.depth
     
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        pass
+
+
 class RandomUniformDepthScheduler:
     def __init__(self, min_value: int = 1, max_value: int = 10, *args, **kwargs):
         """Randomly choose depth at which computing the loss during training.
@@ -123,8 +151,52 @@ class RandomUniformDepthScheduler:
         return self.depth
 
 
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        pass
+
+
+class LinearWeightedDepthScheduler:
+    """Deterministic depth scheduler that spends more steps at deeper levels.
+    Steps per level are proportional to the level number:
+      level 1 gets 1 unit, level 2 gets 2 units, ..., level 10 gets 10 units.
+    Total units = sum(1..max_value) = max_value*(max_value+1)/2
+    """
+    def __init__(self, max_steps: int = 1000, min_value: int = 1, max_value: int = 10, **kwargs):
+        self.min_value = min_value
+        self.max_value = max_value
+        self.depth = min_value
+
+        # Compute step boundaries
+        total_weight = sum(range(min_value, max_value + 1))
+        steps_per_unit = max_steps / total_weight
+        self.boundaries = []  # (start_step, depth)
+        cumulative = 0
+        for d in range(min_value, max_value + 1):
+            self.boundaries.append((int(cumulative), d))
+            cumulative += d * steps_per_unit
+        self.boundaries.append((max_steps, max_value))
+
+    def get_depth(self, global_step):
+        for i in range(len(self.boundaries) - 1):
+            if self.boundaries[i][0] <= global_step < self.boundaries[i + 1][0]:
+                self.depth = self.boundaries[i][1]
+                return self.depth
+        self.depth = self.max_value
+        return self.depth
+
+    def state_dict(self):
+        return {"depth": self.depth}
+
+    def load_state_dict(self, state):
+        self.depth = state["depth"]
+
+
 KNOWN_SCHEDULERS = {
     "linear": LinearDepthScheduler,
+    "linear_weighted": LinearWeightedDepthScheduler,
     "exponential": ExponentialDepthScheduler,
     "random": RandomHeavyTailedDepthScheduler,
     "random_uniform": RandomUniformDepthScheduler,

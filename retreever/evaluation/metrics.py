@@ -1,43 +1,33 @@
-"""Retrieval evaluation metrics for ReTreever."""
-
+from retreever.evaluation import Metric
 from typing import List
 import math
-from abc import ABC, abstractmethod
-
-
-class Metric(ABC):
-    """Base class for evaluation metrics."""
-    
-    def __init__(self, name, **kwargs):
-        self.name = name
-        
-    @abstractmethod
-    def __call__(self, predictions, references, questions=None, ids=None):
-        raise NotImplementedError()
 
 
 class HitK(Metric):
-    """Hit@K metric - fraction of queries where at least one correct answer appears in top-k."""
-    
     def __init__(self, name, **kwargs):
         super().__init__(name, **kwargs)
 
         self.args = kwargs.get("args", None)
 
-        # Check if "k" is one of the arguments
+        # Check if an "k" is one of the arguments
         if self.args and hasattr(self.args, "k"):
             self.k = self.args.k
         else:
-            raise ValueError("You need to specify an integer value for k for the Hit@k metric")
+            raise ("You need to specify an integer value for k for the Hit@k metric")
 
     def _compute(self, predicted_ids: List, gt_ids: List):
         """
         Function to compute hit@k for a single instance.
-        Returns a number between 0 and 1 indicating the fraction of
-        the predicted values that are found in the gt_ids.
+        Returns a  number between 0 and 1 indicating the fraction of
+        the predicted values that found in the gt_ids.
         1 indicates that *all* of the predicted ids are in the gt_ids.
         """
         top_k_predicted = predicted_ids[: self.k]  # Take the top-k predicted IDs
+        # Assumes we have a list of gt indices
+
+        # If any one of the predicted indices are in the gt list, we get a 1
+        # ## hit = any(item in gt_ids for item in top_k_predicted)
+        # ## return 1 if hit else 0
 
         # Count the number of predicted ids that are also in the gt list
         number_of_hits = len([item for item in top_k_predicted if item in gt_ids])
@@ -63,7 +53,7 @@ class HitK(Metric):
 
 class NDCGK(Metric):
     """
-    Normalized Discounted Cumulative Gain (NDCG) @ k metric.
+    This class computes the Normalized Discounted Cumulative Gain (NDCG) @ k metric.
 
     NDCG@k is a measure of ranking quality that evaluates how well the predicted
     ranking of items matches the ground truth. It is calculated as:
@@ -143,41 +133,7 @@ class NDCGK(Metric):
             total_ndcg += self._compute(pred, ref)
 
         return total_ndcg / total_instances if total_instances > 0 else 0.0
-
-
-class RecallK(Metric):
-    """Recall@K metric - proportion of relevant items retrieved in top-k."""
     
-    def __init__(self, name, **kwargs):
-        super().__init__(name, **kwargs)
-        
-        self.args = kwargs.get("args", None)
-        
-        if self.args and hasattr(self.args, "k"):
-            self.k = self.args.k
-        else:
-            raise ValueError("You need to specify an integer value for k for the Recall@k metric")
-    
-    def _compute(self, predicted_ids: List, gt_ids: List):
-        """Compute Recall@K for a single instance."""
-        if len(gt_ids) == 0:
-            return 0.0
-        
-        top_k_predicted = predicted_ids[:self.k]
-        num_relevant_retrieved = len([item for item in top_k_predicted if item in gt_ids])
-        
-        return num_relevant_retrieved / len(gt_ids)
-    
-    def __call__(self, predictions: List[List], references: List[List], questions=None, ids=None):
-        """Compute Recall@K over the dataset."""
-        total_recall = 0.0
-        total_instances = len(predictions)
-        
-        for pred, ref in zip(predictions, references):
-            total_recall += self._compute(pred, ref)
-        
-        return total_recall / total_instances if total_instances > 0 else 0.0
-
 
 class MAPK(Metric):
     """
@@ -188,6 +144,11 @@ class MAPK(Metric):
     where P@i is precision at position i, rel(i) is 1 if item at position i is relevant
     
     mAP@K is the mean of AP@K across all queries.
+    
+    This is better than Hit@K or Recall@K for multi-positive scenarios because:
+    - It rewards early retrieval of positives
+    - It accounts for the number of positives retrieved relative to k
+    - It's more interpretable than NDCG
     """
     
     def __init__(self, name, **kwargs):
@@ -200,7 +161,16 @@ class MAPK(Metric):
             raise ValueError("You need to specify an integer value for k for the mAP@k metric")
     
     def _compute(self, predicted_ids: List, gt_ids: List):
-        """Compute Average Precision @ K for a single query."""
+        """
+        Compute Average Precision @ K for a single query.
+        
+        Args:
+            predicted_ids: List of predicted item IDs (ranked)
+            gt_ids: List of ground truth relevant item IDs
+            
+        Returns:
+            Average Precision @ K (float between 0 and 1)
+        """
         if len(gt_ids) == 0:
             return 0.0
         
@@ -216,12 +186,15 @@ class MAPK(Metric):
                 sum_precisions += precision_at_i
         
         # Normalize by min(number of positives, k)
+        # This makes AP@K comparable across queries with different numbers of positives
         num_relevant = min(len(gt_ids), self.k)
         
         return sum_precisions / num_relevant if num_relevant > 0 else 0.0
     
     def __call__(self, predictions: List[List], references: List[List], questions=None, ids=None):
-        """Compute mean Average Precision @ K across all queries."""
+        """
+        Compute mean Average Precision @ K across all queries.
+        """
         total_ap = 0.0
         total_instances = len(predictions)
         
@@ -229,37 +202,3 @@ class MAPK(Metric):
             total_ap += self._compute(pred, ref)
         
         return total_ap / total_instances if total_instances > 0 else 0.0
-
-
-class MRR(Metric):
-    """Mean Reciprocal Rank - average of reciprocal ranks of the first relevant item."""
-    
-    def __init__(self, name, **kwargs):
-        super().__init__(name, **kwargs)
-        self.args = kwargs.get("args", None)
-        
-        # Optional k parameter to limit search depth
-        self.k = self.args.k if self.args and hasattr(self.args, "k") else None
-    
-    def _compute(self, predicted_ids: List, gt_ids: List):
-        """Compute reciprocal rank for a single query."""
-        if len(gt_ids) == 0:
-            return 0.0
-        
-        search_list = predicted_ids[:self.k] if self.k is not None else predicted_ids
-        
-        for i, pred_id in enumerate(search_list):
-            if pred_id in gt_ids:
-                return 1.0 / (i + 1)
-        
-        return 0.0
-    
-    def __call__(self, predictions: List[List], references: List[List], questions=None, ids=None):
-        """Compute Mean Reciprocal Rank over the dataset."""
-        total_rr = 0.0
-        total_instances = len(predictions)
-        
-        for pred, ref in zip(predictions, references):
-            total_rr += self._compute(pred, ref)
-        
-        return total_rr / total_instances if total_instances > 0 else 0.0

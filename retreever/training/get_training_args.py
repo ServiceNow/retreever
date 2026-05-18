@@ -1,35 +1,27 @@
-"""Training arguments configuration for ReTreever."""
-
 import os
 from omegaconf import DictConfig
 from transformers import TrainingArguments
 
 
 def get_training_args(
-    cfg: DictConfig,
-    savedir: str,
-    local_rank: int = 0,
-    world_size: int = 1
+    cfg: DictConfig, savedir: str, local_rank: int = 0, world_size: int = 1
 ) -> TrainingArguments:
-    """
-    Prepare training arguments from config.
+    """Prepare training args given exp dict and command line args.
 
     Args:
-        cfg: Experiment configuration
-        savedir: Directory to save experiment data
-        local_rank: Rank of executing node (0 for main)
-        world_size: Number of nodes
+        cfg: Experiment namespace
+        savedir: Folder where to save experiment data.
+        local_rank: rank of executing node. 0 for principal.
+        world_size: number of nodes
 
     Returns:
-        TrainingArguments for HuggingFace Trainer
+        TrainingArguments: Training arguments for HF trainer.
     """
     deepspeed_cfg = cfg.get("deepspeed", None)
 
     training_args = TrainingArguments(
-        # Needs to be False since custom dataset passes fields processed in collator
-        remove_unused_columns=False,
-        
-        # Optimization
+        remove_unused_columns=False,  # This needs to be False since our custom dataset passes fields that are processed in the collator.
+        # optimization
         per_device_train_batch_size=cfg.train.train_batch_size,
         per_device_eval_batch_size=cfg.train.test_batch_size,
         max_steps=cfg.train.steps,
@@ -45,24 +37,23 @@ def get_training_args(
         dataloader_num_workers=max(os.cpu_count() // world_size, 1),
         fp16=cfg.train.fp16,
         bf16=cfg.train.bf16,
-        
-        # Logging and checkpointing
+        # logging and checkpointing
         report_to="wandb",
         logging_dir=os.path.join(savedir, "logs"),
         logging_strategy="steps",
         logging_steps=cfg.logging.log_every,
         logging_first_step=True,
         output_dir=savedir,
-        log_on_each_node=False,  # Only rank 0 writes logs
+        log_on_each_node=False,  # Only rank 0 will write logs.
+        # push_to_hub=cfg.push_to_hub,
+        # save_total_limit=5,  # save at most 5 checkpoints (last 4 + best)
         save_strategy="steps",
         save_steps=cfg.logging.log_every,
-        load_best_model_at_end=True,
-        
-        # Evaluation
+        load_best_model_at_end=False,
+        # evaluation
         eval_steps=cfg.logging.log_every,
         evaluation_strategy="steps",
-        
-        # Distributed training
+        # distributed
         ddp_find_unused_parameters=True,
         deepspeed=deepspeed_cfg,
         local_rank=local_rank,

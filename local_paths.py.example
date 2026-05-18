@@ -1,0 +1,27 @@
+"""Local paths for ReTreever.
+
+Copy this file to ``local_paths.py`` (next to it in the repo root) and edit
+the values below for your machine. ``local_paths.py`` is gitignored, so any
+paths you put in it stay private and won't be committed.
+
+ReTreever resolves *all* on-disk locations (Hugging Face cache + per-dataset
+directories) through this single module. If you add a new dataset, register
+its on-disk location here.
+"""
+
+# Hugging Face cache directory used by the encoders and dataset loaders.
+# Set to None to fall back to the default HF cache (~/.cache/huggingface).
+HF_CACHE_DIR = None
+
+# Per-dataset on-disk locations. Keys must match the dataset names recognized
+# by ``scripts/train.py``; values are the absolute path to the directory that
+# the corresponding ReTreever loader expects.  Use ``scripts/data_prep/*.py``
+# to produce these directories from the original sources.
+DATA_PATHS = {
+    "nq": "/path/to/nq",
+    "hotpotqa": "/path/to/hotpotqa",
+    "topiocqa_all_history": "/path/to/topiocqa_all_history",
+    "repliqa_0to3_4": "/path/to/repliqa_0to3_4",
+    "imagenet1k": "/path/to/imagenet1k",
+    "voxceleb2": "/path/to/voxceleb2",
+}

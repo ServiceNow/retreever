@@ -1,6 +1,7 @@
 import os
-import pickle
+import json
 from abc import ABC, abstractmethod
+from annoy import AnnoyIndex
 import torch
 from collections import OrderedDict
 import numpy as np 
@@ -60,12 +61,12 @@ class IndexingStrategy(ABC):
         pass
 
     @abstractmethod
-    def save_index(self, save_path: str = "./tree_index.pckl"):
+    def save_index(self, save_path: str = "./tree_index.json"):
         """
-        Saves the index as pickle object in :save_path
+        Saves the index as a JSON file at :save_path.
 
         Args:
-            save_path(txt): Full path to the pickle file.
+            save_path(str): Full path to the JSON file.
         """
         pass
 
@@ -89,8 +90,168 @@ class IndexingStrategy(ABC):
         return self.size() == 0
 
 
-# Note: GreedyIndexing and TreeRepAnnoyIndexing have been removed.
-# Only FAISS-based indexing strategies are now supported.
+class GreedyIndexing(IndexingStrategy):
+    """
+    Indexing strategy using greedy assignment of contexts to leaves.
+    """
+
+    def __init__(self, num_dimensions, *args):
+        super().__init__(num_dimensions)
+        self.index = None
+
+    def index_ctxs(self, context_assignments, context_names, threshold=0.1, **kwargs):
+        # Leaf assignment mask
+        c_mask = torch.where(context_assignments > threshold, 1, 0).bool()
+
+        for leaf_id, leaf_ctx_names_scores in self.index.items():
+            ctx_to_insert_names = context_names[c_mask[:, leaf_id]]
+            ctx_to_insert_scores = context_assignments[:, leaf_id][c_mask[:, leaf_id]]
+
+            # Sort by score
+            ctx_to_insert_sorted_scores, ctx_to_insert_sorted_idx = torch.sort(
+                ctx_to_insert_scores, descending=True
+            )
+            ctx_to_insert_sorted_names = ctx_to_insert_names[ctx_to_insert_sorted_idx]
+
+            # Merge with existing data, fails if no context has been assigned to the leaf yet
+            try:
+                all_leaf_scores = torch.hstack(
+                    (leaf_ctx_names_scores[1], ctx_to_insert_sorted_scores)
+                )
+                sorted_leaf_scores, sorted_leaf_idx = torch.sort(all_leaf_scores, descending=True)
+                sorted_leaf_names = torch.hstack(
+                    (leaf_ctx_names_scores[0], ctx_to_insert_sorted_names)
+                )[sorted_leaf_idx]
+
+                # tuple with the name and the score of each assigned context
+                self.index[leaf_id] = (sorted_leaf_names, sorted_leaf_scores)
+
+            except TypeError:
+                self.index[leaf_id] = (ctx_to_insert_sorted_names, ctx_to_insert_sorted_scores)
+
+    def top_contexts(self, question_assignments, k):
+        num_questions = question_assignments.size(0)
+
+        # dicts of returned context names per question and their scores
+        topk = [OrderedDict() for _ in range(num_questions)]
+
+        # sort leaf assignments by score and get leaf ids
+        sorted_leaves = torch.argsort(question_assignments, dim=1, descending=True)
+
+        # TODO: avoid double loop (with a tensor index and a tensor topk)
+
+        # Loop over queries
+        for q_idx in range(num_questions):
+            # loop over leaves in descending order of score for current query
+            for leaf_id in sorted_leaves[q_idx].tolist():
+                # return as many contexts as possible from the current leaf
+                num_ctxs_to_retrieve = min(k - len(topk[q_idx]), len(self.index[leaf_id][0]))
+
+                for c in range(num_ctxs_to_retrieve):
+                    # upper bound ctx score by query score for current leaf
+                    c_score = min(question_assignments[q_idx, leaf_id], self.index[leaf_id][1][c])
+
+                    # setdefault do not add contexts that are already retrieved
+                    topk[q_idx].setdefault(int(self.index[leaf_id][0][c]), float(c_score))
+
+                if len(topk[q_idx]) == k:
+                    break
+
+        return topk
+
+    def reset_index(self):
+        self.index = {leaf: None for leaf in range(self.num_dimensions)}
+
+    def build_index(self):
+        pass
+
+    def save_index(self, save_path: str = "./tree_index.json"):
+        # Ensure the directory exists
+        directory = os.path.dirname(save_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        print(f"Saving the tree index to {save_path}")
+        # JSON only supports str keys; map int leaf -> str leaf for serialization.
+        serializable = {
+            str(leaf): (
+                [[name, float(score)] for name, score in entries]
+                if entries is not None
+                else None
+            )
+            for leaf, entries in self.index.items()
+        }
+        with open(save_path, "w") as file:
+            json.dump(serializable, file)
+
+    def size(self):
+        # Gather all unique context names stored in the index in a set
+        stored_ctxts = set()
+        # Iterate over the index
+        for leaf_ctx_names_scores in self.index.values():
+            # Its possible that no contexts are assigned to this leaf.
+            if leaf_ctx_names_scores is None:
+                continue
+            # Gather the context names assigned to this leaf, and convert these names to a list
+            ctxt_names = leaf_ctx_names_scores[0].detach().cpu().tolist()
+            # If there are non zero contexts assigned to this leaf, add their names to the ctxt set
+            if len(ctxt_names) > 0:
+                stored_ctxts.update(ctxt_names)
+        # Return the size of the set consisting of context names stored in the index.
+        return len(stored_ctxts)
+
+
+class TreeRepAnnoyIndexing(IndexingStrategy):
+    """
+    Indexing strategy using the tree-based representations with Annoy (Approximate Nearest Neighbors Library).
+    """
+
+    def __init__(self, num_dimensions, distance="manhattan"):
+        super().__init__(num_dimensions)
+        self.distance = distance
+        self.index = AnnoyIndex(self.num_dimensions, distance)
+        self.index_ready = False
+
+    def index_ctxs(self, context_assignments, context_names, **kwargs):
+        for i in range(context_names.shape[0]):
+            self.index.add_item(
+                context_names[i].detach().cpu().numpy(),
+                context_assignments[i].detach().cpu().numpy(),
+            )
+
+        # Since we added new contexts, index is stale
+        self.index_ready = False
+
+    def top_contexts(self, question_assignments, k):
+        # Need to call build index if index is not ready
+        if not self.index_ready:
+            self.build_index()
+            self.index_ready = True
+
+        num_questions = question_assignments.size(0)
+        topk = []
+
+        for q_idx in range(num_questions):
+            neighbors, distances = self.index.get_nns_by_vector(
+                question_assignments[q_idx].detach().cpu().numpy(), k, include_distances=True
+            )
+            topk.append(OrderedDict(zip(neighbors, distances)))
+        return topk
+
+    def reset_index(self):
+        self.index = AnnoyIndex(self.num_dimensions, self.distance)
+        self.index_ready = False
+
+    def build_index(self):
+        # Argument is number of trees in the index - which is fixed for now to 10.
+        # TODO: Ablate over this to see whats the right value.
+        self.index.build(10)
+
+    def size(self):
+        return self.index.get_n_items()
+    
+    def save_index(self, save_path: str = "./tree_index.pckl"):
+        pass
 
 
 class TreeRepFaissIndexing(IndexingStrategy):
@@ -185,20 +346,10 @@ class TreeRepFaissIndexing(IndexingStrategy):
     def size(self):
         return self.index.ntotal
     
-    def save_index(self, save_path: str = "./tree_index.pckl"):
+    def save_index(self, save_path: str = "./tree_index.json"):
         pass
- 
-import faiss
-import numpy as np
-import torch
-from collections import OrderedDict
 
 
-
-import faiss
-import numpy as np
-import torch
-from collections import OrderedDict
 import heapq
 
 
@@ -441,9 +592,9 @@ class TreeRepMultiIndexFaissIndexing:
     def size(self):
             return sum(idx.ntotal for idx in self.indices)
 
-
-# Only FAISS-based indexing strategies are supported
 index_strategy_dict = {
+    "greedy": GreedyIndexing,
+    "tree_rep": TreeRepAnnoyIndexing,
     "faiss_tree_rep": TreeRepFaissIndexing,
     "tree_rep_multi_index_faiss": TreeRepMultiIndexFaissIndexing,
 }

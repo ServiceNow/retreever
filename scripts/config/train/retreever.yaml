@@ -1,32 +1,44 @@
-# Training hyperparameters
-
-# Batch sizes
 train_batch_size: 64
 test_batch_size: 64
-
-# Optimization
+skip_steps: 1  # Training steps to accumulate gradients through prior to updating params. This will override the value in the deepspeed config, if deepspeed is used.
 learning_rate: 0.0004
 lr_scheduler_type: "linear"
 warmup_ratio: 0.05
 adam_beta1: 0.9
 adam_beta2: 0.95
 adam_epsilon: 1e-6
-weight_decay: 0.05
+weight_decay: 5e-2
 max_grad_norm: 1.0
-
-# Mixed precision
-fp16: true
-bf16: false
-
-# Training duration
-steps: 200000
-skip_steps: 1  # Gradient accumulation steps
-
-# Loss/temperature settings
-freeze_tmp: false
-tmp_scale: 64  # Initial temperature scale
-
-# Hierarchical training (depth curriculum)
-hierarchical: true
+fp16: True
+bf16: False
+steps: 200_000
+freeze_tmp: False
+use_mean_finally: True
+tmp_scale: 64
+hierarchical: True
 depth_warmup_ratio: 0.1
-depth_scheduler_type: "random"  # Options: linear, exponential, random
+depth_scheduler_type: "random"
+balance_hp: 0.
+sharpness_hp: 0.
+l1_lambda: 0.0
+entropy_lambda: 0.0
+max_prob_lambda: 0.0
+use_custom_scheduler: false
+const_temp_contrastive_lambda: []
+const_temps: [30]
+tree_consistency_reg_lambda: 0.0
+optimize_prior_levels_too: False
+path_consistency_lambda: 0.0
+token_train_lambda: 0.0
+token_sim_measure: "cos_sim"
+use_siglip_loss: false
+tree_locality_reg_lambda: 0.0
+max_tmp: 30.0
+use_separate_temps: false
+max_tmp_qc: null
+max_tmp_cq: null
+use_depth_wise_temps: false
+hard_assignment_reg_lambda: 0.0
+optimize_whole_emb: false
+base_loss_type: "contrastive"
+path_consistency_skip_connection_lambda: 0.0

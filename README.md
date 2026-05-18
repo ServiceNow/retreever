@@ -1,276 +1,219 @@
-# ReTreever: Hierarchical Retrieval with Coarse-To-Fine Representations
+# ReTreever
 
-**ReTreever** is a framework for training and evaluating hierarchical retrieval models with multi-resolution representations. It supports multiple modalities (text, images, audio) and encoder fine-tuning strategies.
+Hierarchical tree-based retrieval. The model learns a binary tree of latent
+embeddings — at each internal node, a split function decides which subtree a
+context belongs to. Training is contrastive: in-batch positives are the
+question/context pair, negatives are the rest of the batch.
 
-## Features
+This repository is the minimal training stack for ReTreever on six datasets:
 
-- 🌳 **Hierarchical Retrieval**: Tree-based retrieval with stochastic or constant depth training
-- 🎓 **Depth Curriculum Learning**: Multiple schedulers (random heavy-tailed, random linear, random uniform, linear warmup, exponential warmup)
-- 🎯 **Multi-Resolution Learning**: Matryoshka Representation Learning (MRL) for efficient embedding compression
-- 🔧 **Encoder Fine-tuning**: Shared MLP/Linear adapters with zero-init normalization
-- 🖼️ **Multi-Modal**: Text (DistilBERT, BGE), Images (DinoV2, ResNet, CLIP), Audio (AST), Text-Image (FLAVA)
-- ⚡ **Efficient Training**: DeepSpeed integration, mixed precision, and distributed training
-- 📊 **Comprehensive Evaluation**: NDCG@k, Hit@k, MAP@k metrics with FAISS-based indexing
+| Dataset                 | Modality | Source                                      |
+|-------------------------|----------|---------------------------------------------|
+| `nq`                    | Text     | `ServiceNow/dssk_training_data` (NQ filter) |
+| `hotpotqa`              | Text     | HF `hotpot_qa` (distractor)                 |
+| `topiocqa_all_history`  | Text     | HF `McGill-NLP/TopiOCQA`                    |
+| `repliqa_0to3_4`        | Text     | HF `ServiceNow/repliqa`                     |
+| `imagenet1k`            | Image    | HF `ILSVRC/imagenet-1k` (gated)             |
+| `voxceleb2`             | Audio    | https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox2.html (registration required) |
 
-## Installation
+---
+
+## Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/retreever.git
-cd retreever
-
-# Install in development mode
+conda create -n retreever python=3.10 -y
+conda activate retreever
+pip install -r requirements.txt
 pip install -e .
-
-# Or install from PyPI (when available)
-pip install retreever
-
-# For GPU support with FAISS
-pip install retreever[gpu]
 ```
 
-## Quick Start
-
-### Training a Model
-
-```python
-from retreever.models import ReTreever
-from retreever.training import Trainer
-from retreever.utils import load_config
-
-# Load configuration
-cfg = load_config("configs/imagenet/retreever_stochastic_dinov2.yaml")
-
-# Create model
-model = ReTreever(
-    encoder_type="dinov2-large",
-    tree_type="no_propagation_tree",
-    tree_depth=10,
-    **cfg.model
-)
-
-# Train
-trainer = Trainer(model=model, config=config)
-trainer.train()
-```
-
-## Hierarchical Training with Depth Scheduling
-
-ReTreever supports **hierarchical training**, where the model is trained to make predictions at different tree depths. This is crucial for learning multi-resolution representations.
-
-### Training Strategies
-
-**Constant Depth Training** (`hierarchical: false`)
-- Trains at full tree depth throughout training
-- Simpler but less flexible
-
-**Stochastic Depth Training** (`hierarchical: true`)
-- Randomly samples depth at each training step
-- Better multi-resolution representations
-
-### Depth Schedulers
-
-Configure via `depth_scheduler_type` in config:
-
-```yaml
-train:
-  hierarchical: true  # Enable depth scheduling
-  depth_scheduler_type: "random"  # Scheduler type
-  depth_warmup_ratio: 0.1  # For non-random schedulers
-```
-
-**Available schedulers:**
-
-1. **`random`** (default for stochastic) - RandomHeavyTailedDepthScheduler
-   - Samples with quadratic weights: P(depth=d) ∝ d²
-   - Strongly biases towards deeper levels
-   - Best for final model performance
-
-2. **`random_linear`** - RandomDepthScheduler
-   - Samples with linear weights: P(depth=d) ∝ d
-   - Moderate bias towards deeper levels
-
-3. **`random_uniform`** - RandomUniformDepthScheduler
-   - Uniform sampling across all depths
-   - Equal probability for each depth
-
-4. **`linear`** - LinearDepthScheduler
-   - Gradually increases depth during warmup
-   - Starts at shallow, ends at full depth
-   - Good for curriculum learning
-
-5. **`exponential`** - ExponentialDepthScheduler
-   - Exponentially increases time spent at each depth
-   - Spends more time at deeper levels
-
-### Example Configurations
-
-**Stochastic with heavy-tailed sampling (typical):**
-```yaml
-train:
-  hierarchical: true
-  depth_scheduler_type: "random"
-  steps: 200000
-```
-
-**Constant depth (no scheduling):**
-```yaml
-train:
-  hierarchical: false
-  steps: 200000
-```
-
-**Linear warmup over first 10% of training:**
-```yaml
-train:
-  hierarchical: true
-  depth_scheduler_type: "linear"
-  depth_warmup_ratio: 0.1
-  steps: 200000
-```
-
-### Using Command Line
+Then configure your local paths (this file is gitignored):
 
 ```bash
-# Train ImageNet model with DinoV2
-python scripts/train.py --config configs/imagenet/retreever_stochastic_dinov2.yaml
-
-# Evaluate a trained model on image retrieval
-python scripts/evaluate_image.py --model_ckpt path/to/checkpoint.pt \
-                                   --model_cfg path/to/config.yaml \
-                                   --dataset imagenet \
-                                   --data_dir /path/to/imagenet1k
-
-# Evaluate a trained model on text retrieval
-python scripts/evaluate_text.py --model_ckpt path/to/checkpoint.pt \
-                                  --model_cfg path/to/config.yaml \
-                                  --dataset nq \
-                                  --data_dir /path/to/nq
-
-# Evaluate a trained model on audio retrieval
-python scripts/evaluate_audio.py --model_ckpt path/to/checkpoint.pt \
-                                   --model_cfg path/to/config.yaml \
-                                   --dataset voxceleb2 \
-                                   --data_dir /path/to/voxceleb2
+cp local_paths.py.example local_paths.py
+$EDITOR local_paths.py    # set HF_CACHE_DIR and DATA_PATHS
 ```
 
-## Supported Models
+`local_paths.DATA_PATHS` maps each dataset key (`nq`, `hotpotqa`, …) to the
+directory where its prepared on-disk data lives. The data-prep scripts below
+write into those directories.
 
-### Encoder Fine-tuning Strategies
+---
 
-Three strategies are supported:
+## Prepare datasets
 
-| Strategy | Description |
-|----------|-------------|
-| `shared_mlp_zero_init_norm` | Shared MLP adapter with zero-init and L2 normalization |
-| `shared_linear_zero_init_norm` | Shared linear adapter with zero-init and L2 normalization |
-| `mrl` | Matryoshka Representation Learning (projection layer) |
+Each prep script writes a `DatasetDict` with `train` / `val` / `test` splits
+plus a `cuid2text` lookup, in the schema that ReTreever's collators consume.
+Run only the ones you need.
 
-All strategies share a single adapter between the query and context encoders.
+### HotpotQA
 
-### Indexing Strategies
+```bash
+python -m scripts.data_prep.hotpotqa --out-dir $DATA_PATHS_hotpotqa
+```
 
-| Strategy | Description |
-|----------|-------------|
-| `faiss_tree_rep` | FAISS-based tree representation indexing |
-| `tree_rep_multi_index_faiss` | FAISS with multi-index (one per tree depth) |
+Pulls `hotpot_qa` (config `distractor`) from Hugging Face and emits 10
+distractor paragraphs per row with a 0/1 `useful_contexts` indicator for the
+two supporting paragraphs.
 
-### Split Functions
+### RepliQA (0to3_4 variant)
 
-| Function | Description |
-|----------|-------------|
-| `linear` | Linear projection split |
-| `mlp` | MLP projection split |
-| `cross_attn` | Cross-attention split (supports token-level encoding) |
+```bash
+python -m scripts.data_prep.repliqa_0to3_4 --out-dir $DATA_PATHS_repliqa_0to3_4
+```
 
-## Model Zoo
+Loads `ServiceNow/repliqa`, holds out 400 random `document_id`s from
+`repliqa_3` (seed=42) as val, joins `repliqa_0..3 \ val` as train, and uses
+`repliqa_4` as test. Uses `long_answer` as the gold context.
 
-### Image Models (ImageNet-1K)
+### ImageNet-1K
 
-| Model | Encoder | Strategy | Config | NDCG@10 |
-|-------|---------|----------|--------|---------|
-| **ReTreever (Constant)** | DinoV2-Large | Tree-based | `imagenet/retreever_constant_dinov2.yaml` | TBD |
-| **ReTreever (Stochastic)** | DinoV2-Large | Tree-based | `imagenet/retreever_stochastic_dinov2.yaml` | TBD |
-| **MRL** | DinoV2-Large | Multi-resolution | `imagenet/mrl_dinov2.yaml` | TBD |
+```bash
+# Accept the license at https://huggingface.co/datasets/ILSVRC/imagenet-1k first,
+# then `huggingface-cli login`.
+python -m scripts.data_prep.imagenet1k --out-dir $DATA_PATHS_imagenet1k
+```
 
-### Audio Models (VoxCeleb2)
+Writes a `torchvision.ImageFolder`-style tree
+`{out}/{train,val}/class_NNNN/*.JPEG`. Full extraction is ~150 GB; pass
+`--max-per-class 100` for a quick smoke test.
 
-| Model | Encoder | Strategy | Config | NDCG@10 |
-|-------|---------|----------|--------|---------|
-| **ReTreever (Stochastic)** | AST | Tree-based | `voxceleb/retreever_stochastic_ast.yaml` | TBD |
-| **ReTreever (Constant)** | AST | Tree-based | `voxceleb/retreever_constant_ast.yaml` | TBD |
-| **MRL** | AST | Multi-resolution | `voxceleb/mrl_ast.yaml` | TBD |
+### VoxCeleb2
 
-### Text Models (NQ, HotpotQA, RepliQA, TopiocQA)
+VoxCeleb2 must be obtained from Oxford VGG (registration required):
 
-| Dataset | Model | Encoder | Config | NDCG@10 |
-|---------|-------|---------|--------|---------|
-| **NQ** | ReTreever (MLP Adapter) | DistilBERT | `text/nq_retreever_mlp_distilbert.yaml` | TBD |
-| **NQ** | ReTreever (Linear Adapter) | DistilBERT | `text/nq_retreever_linear_distilbert.yaml` | TBD |
-| **NQ** | MRL | DistilBERT | `text/nq_mrl_distilbert.yaml` | TBD |
-| **HotpotQA** | ReTreever (MLP Adapter) | DistilBERT | `text/hotpotqa_retreever_mlp_distilbert.yaml` | TBD |
-| **RepliQA** | ReTreever (MLP Adapter) | DistilBERT | `text/repliqa_retreever_mlp_distilbert.yaml` | TBD |
-| **TopiocQA** | ReTreever (MLP Adapter) | DistilBERT | `text/topiocqa_retreever_mlp_distilbert.yaml` | TBD |
+```bash
+# 1. Download vox2_dev_aac.zip and vox2_test_aac.zip from the official site.
+unzip vox2_dev_aac.zip  -d /raw/voxceleb2/dev/
+unzip vox2_test_aac.zip -d /raw/voxceleb2/test/
 
-### Multimodal Models (COCO, Flickr30k)
+# 2. Flatten {speaker}/{video}/*.m4a -> {speaker}/*.m4a in the layout
+#    the ReTreever loader expects.
+python -m scripts.data_prep.voxceleb2 \
+    --train-src /raw/voxceleb2/dev/aac \
+    --val-src   /raw/voxceleb2/test/aac \
+    --out-dir   $DATA_PATHS_voxceleb2
+```
 
-| Dataset | Model | Encoder | Config | NDCG@10 |
-|---------|-------|---------|--------|---------|
-| **COCO** | ReTreever | FLAVA | `multimodal/coco_flava.yaml` | TBD |
-| **Flickr30k** | ReTreever | FLAVA | `multimodal/flickr_flava.yaml` | TBD |
+By default the converter creates symlinks (fast, no extra disk). Pass `--copy`
+to materialize real files.
 
-## Directory Structure
+---
+
+## Train
+
+The training entrypoint is `scripts/train.py`, configured by Hydra. The
+top-level config is `scripts/config/train.yaml` which composes
+`config/model/retreever.yaml`, `config/train/retreever.yaml`, and
+`config/logging/wandb.yaml`. Override any field on the command line.
+
+### A first run (HotpotQA, single GPU)
+
+```bash
+WANDB_MODE=disabled \
+python -m scripts.train \
+    dataset=hotpotqa \
+    savedir=runs/hotpotqa_baseline
+```
+
+That's it — `dataset=...` picks the on-disk directory from
+`local_paths.DATA_PATHS`, and everything else defaults reasonably.
+
+### With and without stochastic depth
+
+Stochastic-depth training samples a random tree depth at each step, which
+is what the ReTreever paper does by default. Two flavors:
+
+```bash
+# WITH stochastic depth (default; samples depth ~ heavy-tailed)
+python -m scripts.train dataset=hotpotqa \
+    train.hierarchical=true \
+    train.depth_scheduler_type=random \
+    savedir=runs/hotpotqa_stochastic
+
+# WITHOUT stochastic depth — train at full depth on every step
+python -m scripts.train dataset=hotpotqa \
+    train.hierarchical=false \
+    savedir=runs/hotpotqa_constant_depth
+```
+
+Other depth schedules available: `linear`, `linear_weighted`, `exponential`,
+`random_uniform`, `random_linear`. See
+`retreever/training/depth_schedulers.py`.
+
+### Picking an encoder for each modality
+
+`scripts/config/model/retreever.yaml` defaults to `encoder_type: bge`, which is
+text-only. Image/audio datasets need a matching encoder; override on the CLI:
+
+```bash
+# ImageNet — DINOv2 vision encoder
+python -m scripts.train dataset=imagenet1k \
+    model.encoder_type=dinov2-base \
+    model.encoder_token_level=False \
+    savedir=runs/imagenet1k_dinov2
+
+# VoxCeleb2 — Wav2Vec2 audio encoder
+python -m scripts.train dataset=voxceleb2 \
+    model.encoder_type=wav2vec2-base \
+    model.encoder_token_level=False \
+    savedir=runs/voxceleb2_w2v2
+```
+
+Available text encoders include `bge`, `dpr`, `bert`, `distilbert`,
+`contriever`, `simcse`; vision: `dinov2-*`, `resnet50`, `clip-vit-*`; audio:
+`wav2vec2-*`, `hubert-*`, `wavlm-*`, `ast`, `clap`. See
+`retreever/models/encoders.py` for the full list and the model-name strings
+each one resolves to.
+
+### Smoke test (5 steps + 1 eval cycle, any dataset)
+
+```bash
+WANDB_MODE=disabled python -m scripts.train \
+    dataset=nq \
+    train.steps=5 train.train_batch_size=4 train.test_batch_size=4 \
+    model.tree_depth=4 \
+    logging.log_every=2 logging.factor_val_irrelevant_ctxs=1 \
+    savedir=/tmp/retreever_smoke
+```
+
+Runs in ~4 minutes on a single H100 and triggers eval (hit@k / NDCG@k /
+mAP@k) four times.
+
+### Resuming and checkpoints
+
+Checkpoints are written under `savedir/checkpoint-{step}`. Resume with
+`ckpt=<path>`, or simply re-launch with the same `savedir` and the trainer
+will pick up the latest checkpoint automatically.
+
+---
+
+## Repository layout
 
 ```
 retreever/
-├── configs/              # Model configuration files
-│   ├── imagenet/        # ImageNet configs
-│   ├── voxceleb/        # VoxCeleb configs
-│   ├── text/            # Text retrieval configs
-│   └── multimodal/      # Multimodal configs
-├── retreever/           # Main package
-│   ├── models/          # Model architectures
-│   │   ├── retreever.py # Main ReTreever model
-│   │   ├── mrl.py       # MRL model
-│   │   ├── adapters.py  # Adapter classes (3 strategies)
-│   │   ├── encoders.py  # Encoder implementations
-│   │   ├── split_functions.py  # Tree split functions
-│   │   └── indexing_strategies.py  # FAISS indexing
-│   ├── training/        # Training pipeline
-│   ├── data/            # Data loading
-│   ├── evaluation/      # Evaluation metrics
-│   └── utils/           # Utilities
-├── scripts/             # Training/evaluation scripts
-│   ├── train.py         # Training script
-│   ├── evaluate.py      # General evaluation
-│   ├── evaluate_text.py # Text retrieval evaluation
-│   ├── evaluate_image.py # Image retrieval evaluation
-│   └── evaluate_audio.py # Audio retrieval evaluation
-└── tests/               # Unit & integration tests
+  models/         ReTreever, encoders, trees, split functions, indexing
+  data/           Dataset loaders + collators (text / image / audio)
+  training/       HF Trainer subclass + depth schedulers
+  evaluation/     Retrieval metrics (hit@k, NDCG@k, mAP@k) and eval loop
+  utils/          Losses, distributed gather, path resolver
+scripts/
+  train.py        Hydra entrypoint
+  config/         Hydra config tree
+  data_prep/      One script per dataset (HF -> on-disk DatasetDict / ImageFolder)
+local_paths.py    Machine-specific paths (gitignored; copy from .example)
 ```
 
-## Documentation
+---
 
-- [Training Guide](docs/training_guide.md) - Detailed training instructions
-- [Configuration Guide](CONFIG_GUIDE.md) - Understanding config files and cache settings
+## Tips
 
-## Citation
-
-If you use ReTreever in your research, please cite:
-
-```bibtex
-@article{retreever2026,
-  title={ReTreever: Hierarchical Retrieval with Matryoshka Representations},
-  author={Your Team},
-  journal={arXiv preprint},
-  year={2026}
-}
-```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
+- **Single GPU**: launch via `python -m scripts.train ...`. No DeepSpeed
+  wrapper needed; HF Trainer handles single-GPU correctly.
+- **Multi-GPU / multi-node**: launch via `deepspeed hydra_entrypoint.py
+  --deepspeed=scripts/config/deepspeed.json ...`. The contrastive loss
+  switches to a cross-process gather automatically when `world_size > 1`.
+- **Disabling wandb**: set `WANDB_MODE=disabled` in the environment, or
+  `debug=true` on the CLI to log to stdout instead.
+- **Memory**: `train_batch_size=64` with a `bge-large` encoder and
+  `tree_depth=10` fits comfortably on a single 80 GB H100.
