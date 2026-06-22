@@ -58,10 +58,8 @@ Third-party code adapted into this repository, with attribution.
 
 | Location | Adapted / taken from | License |
 |---|---|---|
-| `retreever/models/trees.py`, `retreever/utils/algo.py` | `github.com/vzantedeschi/LatentTrees` | Unsure (not yet specified in code) |
 | `retreever/utils/neural.py` (`AllGather`) | `Lightning-AI/lightning-bolts` | Apache-2.0 |
 | `retreever/utils/neural.py` (header utilities) | `bigcode-project/bigcode-encoder` | Apache-2.0 |
-| `retreever/utils/jobs.py` (dict-hashing helper) | nuric coding blog post | Attribution only (not a packaged project) |
 | `scripts/train.py` (cache workaround) | HuggingFace `datasets` GitHub issue snippet | Apache-2.0 |
 
 ---
