@@ -5,8 +5,7 @@ weights — these are downloaded at runtime from their original sources under
 their own licenses. A small amount of third-party source code is adapted into
 this repository; see [Adapted source code](#adapted--vendored-source-code).
 
-License entries below reflect each project's publicly published terms. Where a
-license could not be confirmed, the entry reads **Unsure**.
+License entries below reflect each project's publicly published terms.
 
 ---
 
@@ -34,8 +33,8 @@ None are bundled.
 |---|---|---|
 | `bge`, `bgem3` | BAAI/bge-large-en-v1.5, bge-m3 | MIT |
 | `bert` | bert-base-uncased | Apache-2.0 |
-| `dpr` | facebook/dpr-*-encoder-single-nq-base | Unsure |
-| `contriever_msmarco` | facebook/contriever-msmarco | Unsure |
+| `dpr` | facebook/dpr-*-encoder-single-nq-base | CC-BY-NC-4.0 (non-commercial) |
+| `contriever_msmarco` | facebook/contriever-msmarco | CC-BY-NC-4.0 (non-commercial; per facebookresearch/contriever) |
 | `distilbert_msmarco` | sentence-transformers/msmarco-distilbert-cos-v5 | Apache-2.0 |
 | `simcse` | princeton-nlp/sup-simcse-bert-base-uncased | MIT |
 | `llm` (optional) | meta-llama/Llama-3.2-1B-Instruct | Llama 3.2 Community License (custom) |
@@ -90,5 +89,3 @@ Declared in `requirements.txt` / `pyproject.toml`.
 | peft (optional, LoRA) | Apache-2.0 |
 | setuptools (build) | MIT |
 | panns-inference (optional) | Apache-2.0 |
-</content>
-</invoke>
