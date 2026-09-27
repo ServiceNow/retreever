@@ -2,7 +2,7 @@
 
 **Shubham Gupta**¹²⁴, **Siva Reddy**¹²³, **Perouz Taslakian**¹²³, **Valentina Zantedeschi**²⁴, **Cem Subakan**¹⁴
 ¹ Mila – Québec AI Institute · ² ServiceNow Research · ³ McGill University · ⁴ Université Laval
-*Interspeech 2026* · code: <https://github.com/ServiceNow/retreever>
+*Interspeech 2026* · **paper: [PDF](docs/modality_gap/Closing_the_Modality_Gap_Interspeech2026.pdf)** · code: <https://github.com/ServiceNow/retreever>
 
 <p align="center"><img src="docs/modality_gap/arxiv_placeholder.png" width="220" alt="arXiv link coming soon"></p>
 
