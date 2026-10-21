@@ -143,6 +143,7 @@ class RetrievalTrainer(Trainer):
         depth_scheduler=None,
         use_custom_scheduler=False,
         callbacks: Optional[TrainerCallback] = None,
+        encoder_lr: Optional[float] = None,
     ):
         # when passing a tokenizer to the trainer, a DataCollatorWithPadding is automatically instantiated
         super(RetrievalTrainer, self).__init__(
@@ -159,6 +160,41 @@ class RetrievalTrainer(Trainer):
         self.depth_scheduler = depth_scheduler
         self.depth = model.tree_depth
         self.use_custom_scheduler = use_custom_scheduler
+        self.encoder_lr = None if encoder_lr is None else float(encoder_lr)   # train.encoder_learning_rate
+
+    def create_optimizer(self):
+        """HF's default optimizer, except that trainable encoder parameters (query_encoder.*, context_encoder.*) get
+        their own learning rate train.encoder_learning_rate when it is set (partially fine-tuned towers). The weight
+        decay split (no decay on biases / norms) and the LR schedule are unchanged and apply to every group."""
+        if self.encoder_lr is None:
+            return super().create_optimizer()
+        opt_model = self.model
+        if self.optimizer is None:
+            decay_parameters = set(self.get_decay_parameter_names(opt_model))
+            groups = {}
+            for name, p in opt_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                is_enc = name.startswith(("query_encoder.", "context_encoder."))
+                wd = self.args.weight_decay if name in decay_parameters else 0.0
+                key = (is_enc, wd)
+                if key not in groups:
+                    groups[key] = {"params": [], "lr": self.encoder_lr if is_enc else self.args.learning_rate,
+                                   "weight_decay": wd}
+                groups[key]["params"].append(p)
+            grouped = list(groups.values())
+            if getattr(self, "optimizer_cls_and_kwargs", None) is not None:
+                optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+            else:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+            optimizer_kwargs = dict(optimizer_kwargs)
+            optimizer_kwargs.pop("params", None)
+            optimizer_kwargs.pop("model", None)
+            self.optimizer = optimizer_cls(grouped, **optimizer_kwargs)
+            for g in grouped:
+                print(f"optimizer group: lr={g['lr']:.2e} weight_decay={g['weight_decay']} "
+                      f"params={sum(p.numel() for p in g['params']) / 1e6:.2f}M")
+        return self.optimizer
 
     def _save_checkpoint(self, model, trial, **kwargs):
         super()._save_checkpoint(model, trial, **kwargs)
@@ -337,6 +373,7 @@ def get_trainer(
         eval_dataset=validation_data,
         depth_scheduler=depth_scheduler,
         use_custom_scheduler=cfg.train.get("use_custom_scheduler", False),
+        encoder_lr=cfg.train.get("encoder_learning_rate", None),   # own LR for partially fine-tuned towers
         callbacks=[
             EvaluateCallback(
                 wandb_run,

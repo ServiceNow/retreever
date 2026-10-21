@@ -22,6 +22,8 @@ l1_lambda: 0.0
 entropy_lambda: 0.0
 max_prob_lambda: 0.0
 use_custom_scheduler: false
+encoder_learning_rate: null  # separate LR for trainable encoder parameters (unfreeze_last_n_layers > 0); null = same as learning_rate
+save_total_limit: null       # keep only the newest N checkpoints; null = keep all
 const_temp_contrastive_lambda: []
 const_temps: [30]
 tree_consistency_reg_lambda: 0.0

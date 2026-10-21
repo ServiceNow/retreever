@@ -313,6 +313,14 @@ local_paths.py    Machine-specific paths (gitignored; copy from .example)
 
 ---
 
+## Modality-gap experiments (Interspeech 2026)
+
+`experiments/modality_gap/` holds the code and results of *Closing the Modality Gap via Simplex-Constrained
+Representations*: the `flava` and `clap-fused-ta` two-tower encoders, loaders for Clotho, SoundDescs, AudioCaps,
+MS-COCO and Flickr30k (`scripts/data_prep/modality_gap/`), the Linear / MLP / cross-attention adapters with cosine or
+softmax outputs and the normalisation variants of the arXiv revision, an evaluation script for retrieval and gap
+metrics, and the published numbers. See [its README](experiments/modality_gap/README.md).
+
 ## Tips
 
 - **Single GPU**: launch via `python -m scripts.train ...`. No DeepSpeed

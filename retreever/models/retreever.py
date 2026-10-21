@@ -201,6 +201,152 @@ class LinearAdapterWithZeroInitSoftmax(torch.nn.Module):
         return F.softmax(x + self.projection(x), dim=-1)
 
 
+class RMSNorm(torch.nn.Module):
+    """Root-mean-square normalisation (Zhang & Sennrich, 2019): weight * x / rms(x). No centering, no bias."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        inv_rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * inv_rms).to(x.dtype) * self.weight
+
+
+class ScaleNorm(torch.nn.Module):
+    """ScaleNorm (Nguyen & Salazar, 2019): g * x / ||x||_2 with one learned scalar g, initialised to sqrt(dim)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.g = torch.nn.Parameter(torch.tensor(float(dim) ** 0.5))
+
+    def forward(self, x):
+        norm = x.float().norm(dim=-1, keepdim=True).clamp_min(self.eps)
+        return (x.float() / norm).to(x.dtype) * self.g
+
+
+LOGIT_NORM_KINDS = ("none", "layernorm", "layernorm_noaffine", "rmsnorm", "scalenorm")
+
+
+def make_logit_norm(kind, dim: int):
+    """Normalisation applied to the softmax logits of the pooled adapters (config flag model.logit_norm)."""
+    if kind in (None, False, "none"):
+        return None
+    if kind == "layernorm":
+        return torch.nn.LayerNorm(dim)
+    if kind == "layernorm_noaffine":
+        return torch.nn.LayerNorm(dim, elementwise_affine=False)
+    if kind == "rmsnorm":
+        return RMSNorm(dim)
+    if kind == "scalenorm":
+        return ScaleNorm(dim)
+    raise ValueError(f"Unknown logit_norm '{kind}'; choose from {LOGIT_NORM_KINDS}")
+
+
+def unfreeze_last_blocks(encoder, n: int) -> int:
+    """Make the last `n` transformer blocks of the tower this wrapper actually uses trainable, together with the
+    final norm / pooler that produces its pooled feature (config flag model.unfreeze_last_n_layers).
+
+    FLAVA : text_model / image_model .encoder.layer[-n:] + .layernorm (the CLS feature is read after that norm)
+    CLAP  : text tower .encoder.layer[-n:] + .pooler (pooler_output); audio tower (HTS-AT) last n swin blocks + .norm
+    other : model.encoder.layer[-n:] (+ model.pooler when present)
+    Returns the number of parameters switched to requires_grad=True.
+    """
+    model = encoder.model
+    tag = getattr(encoder, "tag", "ctx")
+    mods = []
+    if hasattr(model, "audio_model"):                      # CLAP
+        if tag == "question":
+            tower = model.text_model
+            mods += list(tower.encoder.layer[-n:])
+            if getattr(tower, "pooler", None) is not None:
+                mods.append(tower.pooler)
+        else:
+            ae = model.audio_model.audio_encoder
+            blocks = [b for stage in ae.layers for b in stage.blocks]
+            mods += blocks[-n:] + [ae.norm]
+    elif hasattr(model, "image_model") and hasattr(model, "text_model"):   # FLAVA
+        tower = model.text_model if tag == "question" else model.image_model
+        mods += list(tower.encoder.layer[-n:]) + [tower.layernorm]
+    elif hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
+        mods += list(model.encoder.layer[-n:])
+        if getattr(model, "pooler", None) is not None:
+            mods.append(model.pooler)
+    else:
+        raise ValueError(f"unfreeze_last_blocks: unsupported encoder {type(model).__name__}")
+    count = 0
+    for m in mods:
+        for p in m.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+                count += p.numel()
+    return count
+
+
+class BranchNormAdapterSoftmax(torch.nn.Module):
+    """Pooled softmax adapter with LayerNorms inside the residual branch (config flag model.branch_norm):
+
+        z = x + LN_post( f( LN_pre(x) ) ),   f = Linear  or  4x MLP (fc1 -> ReLU -> dropout -> fc2)
+        output = softmax( logit_norm(z) )     logit_norm: none | layernorm | ... (model.logit_norm)
+
+    The main path x is untouched. f has the standard initialisation; the gain of LN_post starts at 0, so z = x at
+    step 0 (as with the zero-initialised adapters of the paper) and the branch scale is a learned per-dimension gain.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, kind: str = "linear", dropout: float = 0.1, logit_norm: str = "none"):
+        super().__init__()
+        assert kind in ("linear", "mlp"), kind
+        self.kind = kind
+        self.pre_norm = torch.nn.LayerNorm(input_dim)
+        if kind == "linear":
+            self.f = torch.nn.Linear(input_dim, output_dim)
+        else:
+            hidden_dim = input_dim * 4
+            self.f = torch.nn.Sequential(
+                torch.nn.Linear(input_dim, hidden_dim), torch.nn.ReLU(), torch.nn.Dropout(dropout),
+                torch.nn.Linear(hidden_dim, output_dim),
+            )
+        self.post_norm = torch.nn.LayerNorm(output_dim)
+        torch.nn.init.zeros_(self.post_norm.weight)     # branch contributes nothing at step 0
+        self.logit_norm = make_logit_norm(logit_norm, output_dim)
+
+    def forward(self, x):
+        z = x + self.post_norm(self.f(self.pre_norm(x)))
+        if self.logit_norm is not None:
+            z = self.logit_norm(z)
+        return F.softmax(z, dim=-1)
+
+
+class MLPAdapterWithZeroInitSoftmaxLN(MLPAdapterWithZeroInitSoftmax):
+    """MLPAdapterWithZeroInitSoftmax with a normalisation on the logits before the softmax.
+    norm: layernorm (default) | layernorm_noaffine | rmsnorm | scalenorm  (config flag model.logit_norm)."""
+
+    def __init__(self, *args, norm: str = "layernorm", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logit_norm = make_logit_norm(norm, self.fc2.out_features)
+
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return F.softmax(self.logit_norm(residual + x), dim=-1)
+
+
+class LinearAdapterWithZeroInitSoftmaxLN(LinearAdapterWithZeroInitSoftmax):
+    """LinearAdapterWithZeroInitSoftmax with a normalisation on the logits before the softmax (see the MLP version)."""
+
+    def __init__(self, *args, norm: str = "layernorm", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logit_norm = make_logit_norm(norm, self.projection.out_features)
+
+    def forward(self, x):
+        return F.softmax(self.logit_norm(x + self.projection(x)), dim=-1)
+
+
 class MLPAdapterWithoutResidual(torch.nn.Module):
     """MLP adapter with 4x expansion and residual connection."""
     def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.1):
@@ -305,9 +451,10 @@ class QFormerPoolingAdapter(torch.nn.Module):
     Shared between query and context encoders.
     """
 
-    def __init__(self, d_model: int, num_queries: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_queries: int, n_heads: int, dropout: float = 0.1, use_layernorm: bool = True):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.use_layernorm = use_layernorm
 
         self.num_queries = num_queries
         self.d_model = d_model
@@ -326,8 +473,8 @@ class QFormerPoolingAdapter(torch.nn.Module):
 
         self.attn_dropout = torch.nn.Dropout(p=dropout)
 
-        # Post-attention layer norm
-        self.norm = torch.nn.LayerNorm(d_model)
+        # Post-attention layer norm (use_layernorm=False swaps it for the identity: the '_noln' strategies)
+        self.norm = torch.nn.LayerNorm(d_model) if use_layernorm else torch.nn.Identity()
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
@@ -451,6 +598,16 @@ class ReTreever(torch.nn.Module):
         # Adapter/finetuning hyperparameters
         adapter_bottleneck_dim = module_params.pop("adapter_bottleneck_dim", 64)
         mlp_dropout = module_params.pop("mlp_dropout", 0.1)
+        # Pooled softmax adapters (modality-gap experiments): normalisation of the logits, residual-branch norms,
+        # and partial fine-tuning of the towers. See experiments/modality_gap/README.md.
+        logit_layernorm = module_params.pop("logit_layernorm", False)   # legacy alias of logit_norm=layernorm
+        logit_norm = module_params.pop("logit_norm", None)              # none | layernorm | layernorm_noaffine | rmsnorm | scalenorm
+        if logit_norm is None:
+            logit_norm = "layernorm" if logit_layernorm else "none"
+        if logit_norm not in LOGIT_NORM_KINDS:
+            raise ValueError(f"model.logit_norm={logit_norm!r}; choose from {LOGIT_NORM_KINDS}")
+        branch_norm = bool(module_params.pop("branch_norm", False))
+        unfreeze_last_n_layers = int(module_params.pop("unfreeze_last_n_layers", 0) or 0)
         lora_r = module_params.pop("lora_r", 8)
         lora_alpha = module_params.pop("lora_alpha", 16)
         lora_dropout = module_params.pop("lora_dropout", 0.1)
@@ -753,20 +910,45 @@ class ReTreever(torch.nn.Module):
                 self.context_projection = MLPAdapterWithZeroInitNorm(emb_size, emb_size, dropout=mlp_dropout)
 
             elif encoder_finetune_strategy == "shared_linear_zero_init_softmax":
-                # Shared linear adapter with softmax output (probability distribution)
+                # Shared linear adapter with softmax output (probability distribution). model.branch_norm adds
+                # LayerNorms inside the residual branch; model.logit_norm adds a norm on the logits before the softmax.
                 freeze_module(self.query_encoder)
                 freeze_module(self.context_encoder)
-                adapter = LinearAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
+                if branch_norm:
+                    adapter = BranchNormAdapterSoftmax(emb_size, emb_size, kind="linear", dropout=mlp_dropout, logit_norm=logit_norm)
+                elif logit_norm != "none":
+                    adapter = LinearAdapterWithZeroInitSoftmaxLN(emb_size, emb_size, dropout=mlp_dropout, norm=logit_norm)
+                else:
+                    adapter = LinearAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
                 self.query_projection = adapter
                 self.context_projection = adapter
+                print(f"shared_linear_zero_init_softmax: logit_norm={logit_norm} branch_norm={branch_norm}")
 
             elif encoder_finetune_strategy == "shared_mlp_zero_init_softmax":
-                # Shared MLP adapter with softmax output (probability distribution)
+                # Shared MLP adapter with softmax output (probability distribution); same flags as the linear one.
                 freeze_module(self.query_encoder)
                 freeze_module(self.context_encoder)
-                adapter = MLPAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
+                if branch_norm:
+                    adapter = BranchNormAdapterSoftmax(emb_size, emb_size, kind="mlp", dropout=mlp_dropout, logit_norm=logit_norm)
+                elif logit_norm != "none":
+                    adapter = MLPAdapterWithZeroInitSoftmaxLN(emb_size, emb_size, dropout=mlp_dropout, norm=logit_norm)
+                else:
+                    adapter = MLPAdapterWithZeroInitSoftmax(emb_size, emb_size, dropout=mlp_dropout)
                 self.query_projection = adapter
                 self.context_projection = adapter
+                print(f"shared_mlp_zero_init_softmax: logit_norm={logit_norm} branch_norm={branch_norm}")
+
+            elif encoder_finetune_strategy in ("shared_qformer_pooling_noln", "shared_qformer_pooling_softmax_noln"):
+                # The cross-attention pooling adapters without their post-attention LayerNorm (ablation).
+                freeze_module(self.query_encoder)
+                freeze_module(self.context_encoder)
+                if not self.token_level_enc:
+                    raise ValueError(f"{encoder_finetune_strategy} requires token-level encoder output. Set encoder_token_level=True in config.")
+                cls = QFormerPoolingAdapterSoftmax if encoder_finetune_strategy.endswith("softmax_noln") else QFormerPoolingAdapter
+                adapter = cls(d_model=emb_size, num_queries=num_cross_attn_queries, n_heads=qformer_n_heads, dropout=mlp_dropout, use_layernorm=False)
+                self.query_projection = adapter
+                self.context_projection = adapter
+                print(f"{encoder_finetune_strategy}: Q={num_cross_attn_queries}, n_heads={qformer_n_heads}, d_model={emb_size}, LayerNorm=off")
 
             elif encoder_finetune_strategy == "pre_norm_mlp":
                 # Freeze encoders, add MLP adapter on top
@@ -861,7 +1043,20 @@ class ReTreever(torch.nn.Module):
                             
             else:
                 raise ValueError(f"Unknown encoder_finetune_strategy: {encoder_finetune_strategy}")
-            
+
+        # model.unfreeze_last_n_layers: after the strategy has frozen the towers, re-enable the last N transformer
+        # blocks of each tower (plus the final norm / pooler feeding the pooled feature). Respects the lock-in flags.
+        if unfreeze_last_n_layers > 0:
+            towers = [self.query_encoder, self.context_encoder]
+            if self.lock_in_query_encoder:
+                towers = [self.context_encoder]
+            elif self.lock_in_context_encoder:
+                towers = [self.query_encoder]
+            for enc in towers:
+                n_params = unfreeze_last_blocks(enc, unfreeze_last_n_layers)
+                print(f"unfreeze_last_n_layers={unfreeze_last_n_layers}: {enc.__class__.__name__}(tag={getattr(enc, 'tag', '?')}) "
+                      f"-> {n_params / 1e6:.2f}M encoder parameters trainable")
+
         # Load from checkpoint if provided (must happen after LoRA is applied)
         if self._pending_checkpoint_load is not None:
             checkpoint_path, freeze_components = self._pending_checkpoint_load
@@ -1359,3 +1554,66 @@ class ReTreever(torch.nn.Module):
             # if single tree for contexts and queries, concatenate contexts and queries for initialization
             embeddings = torch.vstack((c_embeddings, q_embeddings))
             self.context_tree._init_split_fn(embeddings, depth)
+
+
+def load_from_ckpt(ckpt_path: str, cfg_path: str, cache_dir: str = None, device: str = "cpu"):
+    """Rebuild a trained ReTreever from a run directory's ``config.yaml`` and load ``pytorch_model.bin``.
+
+    Mirrors the constructor call of ``scripts/train.py`` (no loss terms) so that every model flag used in training,
+    including the modality-gap ones (logit_norm, branch_norm, unfreeze_last_n_layers), is honoured at evaluation time.
+    Returns ``(model, cfg)``.
+    """
+    from omegaconf import OmegaConf
+    cfg = OmegaConf.load(cfg_path)
+    m = cfg.model
+    if cache_dir is None:
+        from retreever.utils.toolkit_paths import PATH_HF_CACHE_RW
+        cache_dir = PATH_HF_CACHE_RW
+    model = ReTreever(
+        loss=None,
+        token_loss_term=None,
+        encoder_type=m.encoder_type,
+        freeze_encoder=m.freeze_encoder,
+        tree_type=m.tree_type,
+        cache_dir=cache_dir,
+        dual_model=m.dual_model,
+        tree_depth=m.tree_depth,
+        tree_split_fn=m.tree_split_fn,
+        encoder_token_level=m.encoder_token_level,
+        encoder_normalize=m.encoder_normalize,
+        encoder_context_length=m.encoder_context_length,
+        embedding_dim=m.get("split_fn_embedding_dim", 768),
+        num_embeddings_per_node=m.get("num_embeddings_per_node", 1),
+        scoring_fn_name=m.get("cross_attn_scoring_fn_name", "linear_then_mean"),
+        d_k=m.get("split_fn_d_k", 768),
+        n_heads=m.get("split_fn_n_heads", 12),
+        eval_strategy=m.get("eval_strategy", "greedy"),
+        train_full_tree_rep=m.get("train_full_tree_rep", False),
+        use_sigmoid_in_projection=m.get("use_sigmoid_in_projection", False),
+        attend_ne_only_on_text=m.get("attend_ne_only_on_text", False),
+        enable_llm_split_score_prop=m.get("enable_llm_split_score_prop", False),
+        token_mixer_type=m.get("token_mixer_type", None),
+        node_embedding_strategy=m.get("node_embedding_strategy", "independent"),
+        treat_attn_as_residual=m.get("treat_attn_as_residual", False),
+        have_ffn_layer=m.get("have_ffn_layer", False),
+        lock_in_query_encoder=m.get("lock_in_query_encoder", False),
+        lock_in_context_encoder=m.get("lock_in_context_encoder", False),
+        vq_residual=m.get("vq_residual", False),
+        use_simvq=m.get("use_simvq", False),
+        dropout_location=m.get("dropout_location", "inside_split"),
+        encoder_finetune_strategy=m.get("encoder_finetune_strategy", "none"),
+        num_cross_attn_queries=m.get("num_cross_attn_queries", 10),
+        logit_layernorm=m.get("logit_layernorm", False),
+        logit_norm=m.get("logit_norm", None),
+        branch_norm=m.get("branch_norm", False),
+        unfreeze_last_n_layers=m.get("unfreeze_last_n_layers", 0),
+    )
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state = {k: v for k, v in state.items() if not k.startswith("loss.")}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if not k.startswith("loss.")]
+    if missing:
+        print(f"load_from_ckpt: {len(missing)} keys missing from the checkpoint (first: {missing[:3]})")
+    if unexpected:
+        print(f"load_from_ckpt: {len(unexpected)} unexpected keys in the checkpoint (first: {unexpected[:3]})")
+    return model, cfg

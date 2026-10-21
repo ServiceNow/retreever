@@ -62,8 +62,8 @@ results/
 /local_paths.py
 
 # Data directories (too large to commit)
-data/
-datasets/
+/data/
+/datasets/
 
 # HuggingFace cache (too large to commit)
 .cache/

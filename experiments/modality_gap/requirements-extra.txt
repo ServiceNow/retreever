@@ -1,0 +1,6 @@
+# Extra dependencies of the modality-gap experiments, on top of the repository's requirements.txt
+soundfile          # audio I/O in the data-preparation scripts
+audiomentations    # clotho_augment.py (waveform augmentations for clotho_augmented)
+scikit-learn       # silhouette score in modality_gap_metrics.py
+pandas             # results tables
+matplotlib         # generate_plots.py
