@@ -46,7 +46,7 @@ def get_training_args(
         output_dir=savedir,
         log_on_each_node=False,  # Only rank 0 will write logs.
         # push_to_hub=cfg.push_to_hub,
-        # save_total_limit=5,  # save at most 5 checkpoints (last 4 + best)
+        save_total_limit=cfg.train.get("save_total_limit", None),  # keep only the newest N checkpoints (None = keep all)
         save_strategy="steps",
         save_steps=cfg.logging.log_every,
         load_best_model_at_end=False,

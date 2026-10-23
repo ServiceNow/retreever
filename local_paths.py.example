@@ -23,6 +23,16 @@ DATA_PATHS = {
     "repliqa": "/path/to/repliqa",
     "imagenet1k": "/path/to/imagenet1k",
     "voxceleb2": "/path/to/voxceleb2",
+    # Modality-gap paper datasets (scripts/data_prep/modality_gap/): each directory holds the HF DatasetDict
+    # ("dataset", or "dataset_augmented" for clotho_augmented) next to the audio/ or images/ files.
+    # "clotho": "/path/to/clotho",
+    # "clotho_augmented": "/path/to/clotho",            # same directory as clotho
+    # "sounddescs": "/path/to/sounddescs",
+    # "audiocaps": "/path/to/audiocaps",
+    # "coco": "/path/to/coco",
+    # "flickr30k": "/path/to/flickr30k",
+    # Optional: pre-computed CLAP mel features (preprocess_*.py); default is "<dataset>_<encoder>" next to the dataset
+    # "clotho_augmented_clap-fused-ta": "/path/to/clotho_augmented_clap-fused-ta",
     # Add your own datasets here, e.g.:
     # "my_dataset": "/path/to/my_dataset",
 }

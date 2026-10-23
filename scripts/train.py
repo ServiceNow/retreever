@@ -33,10 +33,14 @@ from retreever.data.collators import (
     SupervisedCollator,
     ImageSupervisedCollator,
     AudioSupervisedCollator,
+    TextImageSupervisedCollator,
+    TextAudioSupervisedCollator,
 )
 
 from retreever.data.imagenet_dataset import ImageNetRetrievalDataset
 from retreever.data.voxceleb_dataset import VoxCeleb2RetrievalDataset
+from retreever.data.text_audio_dataset import TextAudioRetrievalDataset
+from retreever.data.text_image_dataset import TextImageRetrievalDataset
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -49,6 +53,36 @@ logger = logging.getLogger(__name__)
 set_random_seed()
 
 CONFIG_NAME = "train.yaml"
+
+# Text-image and text-audio retrieval datasets of "Closing the Modality Gap via Simplex-Constrained Representations".
+# Each entry: the sub-directory holding the HF DatasetDict (train/val/test) under local_paths.DATA_PATHS[name], and for
+# audio the native sample rate of the files (resampled to 48 kHz for CLAP). See scripts/data_prep/modality_gap/.
+TEXT_IMAGE_DATASETS = {"flickr30k": "dataset", "coco": "dataset"}
+TEXT_AUDIO_DATASETS = {
+    "clotho": ("dataset", 44100),
+    "clotho_augmented": ("dataset_augmented", 44100),
+    "sounddescs": ("dataset", 44100),
+    "audiocaps": ("dataset", 16000),
+}
+
+
+def preprocessed_audio_dir(dataset_name: str, encoder_type: str):
+    """Directory of pre-computed CLAP mel features for a text-audio dataset (``{context_uid}.pt`` files written by
+    scripts/data_prep/modality_gap/preprocess_clap_features.py), or None to fall back to raw waveforms (much slower).
+    Resolved from local_paths.DATA_PATHS["<dataset>_<encoder>"] if present, else "<dataset>_<encoder>" next to the
+    dataset directory (clotho_augmented: "clotho_augmented_<encoder>")."""
+    from pathlib import Path
+    key = f"{dataset_name}_{encoder_type}"
+    if key in KNOWN_DATASETS:
+        p = Path(KNOWN_DATASETS[key])
+    else:
+        root = Path(KNOWN_DATASETS[dataset_name])
+        p = root.parent / f"{dataset_name}_{encoder_type}"
+    if p.exists():
+        return str(p)
+    logger.warning(f"No pre-computed audio features at {p}; raw waveforms will be processed on the fly (slow). "
+                   f"Run scripts/data_prep/modality_gap/preprocess_clap_features.py first.")
+    return None
 
 # Supported dataset names and their on-disk locations are configured in
 # ``local_paths.DATA_PATHS`` (re-exported above as ``KNOWN_DATASETS``).
@@ -111,6 +145,22 @@ def train(cfg: OmegaConf):
             audio_ext="m4a",
             subset=20,
         )
+    elif cfg.dataset in TEXT_IMAGE_DATASETS:
+        from pathlib import Path
+        dataset_dict = datasets.load_from_disk(Path(KNOWN_DATASETS[cfg.dataset]) / TEXT_IMAGE_DATASETS[cfg.dataset])
+        training_data = TextImageRetrievalDataset(data=dataset_dict["train"], images_base_dir=KNOWN_DATASETS[cfg.dataset])
+        validation_data = TextImageRetrievalDataset(data=dataset_dict["val"], images_base_dir=KNOWN_DATASETS[cfg.dataset], subset_size=1000)
+    elif cfg.dataset in TEXT_AUDIO_DATASETS:
+        from pathlib import Path
+        subdir, source_sr = TEXT_AUDIO_DATASETS[cfg.dataset]
+        dataset_dict = datasets.load_from_disk(Path(KNOWN_DATASETS[cfg.dataset]) / subdir)
+        preprocessed_dir = preprocessed_audio_dir(cfg.dataset, cfg.model.encoder_type)
+        training_data = TextAudioRetrievalDataset(
+            data=dataset_dict["train"], audio_base_dir=KNOWN_DATASETS[cfg.dataset],
+            source_sample_rate=source_sr, target_sample_rate=48000, preprocessed_dir=preprocessed_dir)
+        validation_data = TextAudioRetrievalDataset(
+            data=dataset_dict["val"], audio_base_dir=KNOWN_DATASETS[cfg.dataset],
+            source_sample_rate=source_sr, target_sample_rate=48000, subset_size=400, preprocessed_dir=preprocessed_dir)
     else:
         if "+" in cfg.dataset:
             ds_names = cfg.dataset.split("+")
@@ -358,6 +408,11 @@ def train(cfg: OmegaConf):
             finetuned_encoder_checkpoint=cfg.model.get("finetuned_encoder_checkpoint", None),
             freeze_finetuned_components=cfg.model.get("freeze_finetuned_components", True),
             num_cross_attn_queries=cfg.model.get("num_cross_attn_queries", 10),
+            # Pooled softmax adapters (modality-gap experiments): logit norm, residual-branch norms, partial fine-tuning
+            logit_layernorm=cfg.model.get("logit_layernorm", False),
+            logit_norm=cfg.model.get("logit_norm", None),
+            branch_norm=cfg.model.get("branch_norm", False),
+            unfreeze_last_n_layers=cfg.model.get("unfreeze_last_n_layers", 0),
             # Tree adapter for cross-dataset transfer
             tree_adapter_targets=cfg.model.get("tree_adapter_targets", []),
             tree_adapter_lora_r=cfg.model.get("tree_adapter_lora_r", 8),
@@ -409,6 +464,14 @@ def train(cfg: OmegaConf):
             model.query_encoder.processor,
             model.context_encoder.processor,
         )
+    elif cfg.dataset in TEXT_IMAGE_DATASETS:
+        collator = TextImageSupervisedCollator(
+            query_tokenizer=model.query_encoder.tokenizer,
+            ctx_processor=model.context_encoder.processor,
+        )
+    elif cfg.dataset in TEXT_AUDIO_DATASETS:
+        # text queries are tokenised here; the audio contexts arrive as pre-computed mel features or raw waveforms
+        collator = TextAudioSupervisedCollator(query_tokenizer=model.query_encoder.tokenizer)
     else:
         # topiocqa packs the full conversation history into the
         # question (most recent turn last), so we want to truncate from the

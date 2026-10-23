@@ -36,6 +36,10 @@ path_loss_all_levels: false
 margin: 0.2
 use_dynamic_margin: false
 encoder_finetune_strategy: "none"
+# Pooled softmax adapters (modality-gap experiments, see experiments/modality_gap/README.md)
+logit_norm: "none"           # norm on the logits before the softmax: none | layernorm | layernorm_noaffine | rmsnorm | scalenorm
+branch_norm: false           # LayerNorms inside the adapter's residual branch (post-norm gain starts at 0)
+unfreeze_last_n_layers: 0    # fine-tune the last N transformer blocks of each tower (0 = towers frozen)
 finetuned_encoder_checkpoint: null
 freeze_finetuned_components: true
 num_cross_attn_queries: 10
